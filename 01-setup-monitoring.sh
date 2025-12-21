@@ -73,15 +73,15 @@ fi
 # --- 3. Directory & Permission Prep ---
 echo "--- Phase 2: Directory Preparation ---"
 
+# Take ownership to current user to allow writing configs without sudo
+sudo chown -R "$USER":"$USER" "$PROMETHEUS_BASE"
+sudo chown -R "$USER":"$USER" "$GRAFANA_BASE"
+
 # Create config structures
 mkdir -p "$PROMETHEUS_BASE/config/certs"
 mkdir -p "$GRAFANA_BASE/config/certs"
 mkdir -p "$GRAFANA_BASE/provisioning/datasources"
 mkdir -p "$GRAFANA_BASE/provisioning/dashboards"
-
-# Take ownership to current user to allow writing configs without sudo
-sudo chown -R "$USER":"$USER" "$PROMETHEUS_BASE"
-sudo chown -R "$USER":"$USER" "$GRAFANA_BASE"
 
 # --- 4. Certificate Staging ---
 echo "--- Phase 3: Staging Certificates ---"
@@ -259,8 +259,8 @@ sudo chmod 600 "$PROMETHEUS_BASE/config/certs/prometheus.key"
 sudo chmod 600 "$GRAFANA_BASE/config/certs/grafana.key"
 
 # Lock env files
-chmod 600 "$GRAFANA_BASE/grafana.env"
-chmod 600 "$HOST_CICD_ROOT/elk/elasticsearch-exporter.env"
+sudo chmod 600 "$GRAFANA_BASE/grafana.env"
+sudo chmod 600 "$HOST_CICD_ROOT/elk/elasticsearch-exporter.env"
 
 echo "✅ Architect Setup Complete."
 echo "   - Secrets persisted."
