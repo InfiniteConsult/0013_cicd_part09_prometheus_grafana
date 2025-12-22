@@ -180,6 +180,12 @@ scrape_configs:
       - targets: ['mattermost.cicd.local:8067']
 EOF
 
+cat << EOF > "$PROMETHEUS_BASE/config/web-config.yml"
+tls_server_config:
+  cert_file: /etc/prometheus/certs/prometheus.crt
+  key_file: /etc/prometheus/certs/prometheus.key
+EOF
+
 # B. Grafana Config (grafana.ini)
 cat << EOF > "$GRAFANA_BASE/config/grafana.ini"
 [server]
