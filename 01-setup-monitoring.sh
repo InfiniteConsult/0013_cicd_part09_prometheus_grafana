@@ -99,8 +99,6 @@ echo "   Certificates staged."
 
 # --- 5. Configuration Generation ---
 echo "--- Phase 4: Generating Configurations ---"
-
-# A. Prometheus Config (The Map)
 cat << EOF > "$PROMETHEUS_BASE/config/prometheus.yml"
 global:
   scrape_interval: 15s
@@ -120,7 +118,6 @@ scrape_configs:
     scheme: https
     tls_config:
       ca_file: /etc/prometheus/certs/ca.pem
-      # Verified: Cert has IP SAN 172.30.0.1
     static_configs:
       - targets: ['172.30.0.1:9100']
 
@@ -155,13 +152,14 @@ scrape_configs:
     static_configs:
       - targets: ['jenkins.cicd.local:10400']
 
-  # 7. SonarQube
+  # 7. SonarQube (Prometheus v3.x Syntax)
   - job_name: 'sonarqube'
     metrics_path: /api/monitoring/metrics
     static_configs:
       - targets: ['sonarqube.cicd.local:9000']
     http_headers:
-      X-Sonar-Passcode: $SONAR_WEB_SYSTEMPASSCODE
+      X-Sonar-Passcode:
+        values: ["$SONAR_WEB_SYSTEMPASSCODE"]
 
   # 8. Artifactory
   - job_name: 'artifactory'
@@ -171,14 +169,14 @@ scrape_configs:
       ca_file: /etc/prometheus/certs/ca.pem
     static_configs:
       - targets: ['artifactory.cicd.local:8443']
-    http_headers:
-      Authorization: Bearer $ARTIFACTORY_ADMIN_TOKEN
+    bearer_token: "$ARTIFACTORY_ADMIN_TOKEN"
 
   # 9. Mattermost
   - job_name: 'mattermost'
     static_configs:
       - targets: ['mattermost.cicd.local:8067']
 EOF
+
 
 cat << EOF > "$PROMETHEUS_BASE/config/web-config.yml"
 tls_server_config:
