@@ -71,7 +71,7 @@ docker exec \
     # --- Infrastructure (The Translators) ---
     check_metric "Node Exporter" "https://172.30.0.1:9100/metrics"
     check_metric "ES Exporter"   "https://elasticsearch-exporter.cicd.local:9114/metrics"
-    check_metric "cAdvisor"      "http://cadvisor:8080/metrics"
+    check_metric "cAdvisor"      "http://cadvisor.cicd.local:8080/metrics"
 
     # --- Applications (The Retrofit) ---
     check_metric "GitLab"        "https://gitlab.cicd.local:10300/-/metrics"

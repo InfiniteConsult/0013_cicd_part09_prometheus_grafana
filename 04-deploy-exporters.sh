@@ -190,7 +190,7 @@ docker run -d \
   --name cadvisor \
   --restart always \
   --network cicd-net \
-  --hostname cadvisor \
+  --hostname cadvisor.cicd.local \
   --privileged \
   --device /dev/kmsg \
   --volume /:/rootfs:ro \
