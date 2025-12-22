@@ -20,7 +20,7 @@ PROMETHEUS_BASE="$HOST_CICD_ROOT/prometheus"
 GRAFANA_BASE="$HOST_CICD_ROOT/grafana"
 MASTER_ENV_FILE="$HOST_CICD_ROOT/cicd.env"
 
-# Source CA Paths (Existing from Article 2 & 6)
+# Source CA Paths
 CA_DIR="$HOST_CICD_ROOT/ca"
 SRC_CA_CRT="$CA_DIR/pki/certs/ca.pem"
 SRC_PROM_CRT="$CA_DIR/pki/services/prometheus.cicd.local/prometheus.cicd.local.crt.pem"
@@ -38,7 +38,7 @@ if [ ! -f "$MASTER_ENV_FILE" ]; then
     exit 1
 fi
 
-# Load existing secrets to check for dependencies
+# Load existing secrets
 set -a
 source "$MASTER_ENV_FILE"
 set +a
@@ -63,10 +63,9 @@ generate_passcode() { openssl rand -hex 32; }
 append_secret "GRAFANA_ADMIN_PASSWORD" "$(generate_password)"
 append_secret "SONAR_WEB_SYSTEMPASSCODE" "$(generate_passcode)"
 
-# Validate dependencies (Must exist from previous articles)
+# Validate dependencies
 if [ -z "$ARTIFACTORY_ADMIN_TOKEN" ] || [ -z "$ELASTIC_PASSWORD" ]; then
     echo "❌ ERROR: Missing dependency secrets (ARTIFACTORY_ADMIN_TOKEN or ELASTIC_PASSWORD)."
-    echo "   Please ensure previous articles (Artifactory/ELK) are set up."
     exit 1
 fi
 
@@ -102,7 +101,6 @@ echo "   Certificates staged."
 echo "--- Phase 4: Generating Configurations ---"
 
 # A. Prometheus Config (The Map)
-# We inject secrets directly into this file.
 cat << EOF > "$PROMETHEUS_BASE/config/prometheus.yml"
 global:
   scrape_interval: 15s
@@ -115,25 +113,31 @@ scrape_configs:
     tls_config:
       ca_file: /etc/prometheus/certs/ca.pem
     static_configs:
-      - targets: ['localhost:9090']
+      - targets: ['prometheus.cicd.local:9090']
 
   # 2. Node Exporter (Host Hardware)
-  # Targets the Gateway IP because Node Exporter is on Host Network
   - job_name: 'node-exporter'
+    scheme: https
+    tls_config:
+      ca_file: /etc/prometheus/certs/ca.pem
+      # Verified: Cert has IP SAN 172.30.0.1
     static_configs:
       - targets: ['172.30.0.1:9100']
 
   # 3. cAdvisor (Container Stats)
   - job_name: 'cadvisor'
     static_configs:
-      - targets: ['cadvisor:8080']
+      - targets: ['cadvisor.cicd.local:8080']
 
   # 4. Elasticsearch Exporter
   - job_name: 'elasticsearch-exporter'
+    scheme: https
+    tls_config:
+      ca_file: /etc/prometheus/certs/ca.pem
     static_configs:
-      - targets: ['elasticsearch-exporter:9114']
+      - targets: ['elasticsearch-exporter.cicd.local:9114']
 
-  # 5. GitLab (Application Metrics)
+  # 5. GitLab
   - job_name: 'gitlab'
     metrics_path: /-/metrics
     scheme: https
@@ -142,7 +146,7 @@ scrape_configs:
     static_configs:
       - targets: ['gitlab.cicd.local:10300']
 
-  # 6. Jenkins (Build Metrics)
+  # 6. Jenkins
   - job_name: 'jenkins'
     metrics_path: /prometheus/
     scheme: https
@@ -151,17 +155,15 @@ scrape_configs:
     static_configs:
       - targets: ['jenkins.cicd.local:10400']
 
-  # 7. SonarQube (Quality Metrics)
+  # 7. SonarQube
   - job_name: 'sonarqube'
     metrics_path: /api/monitoring/metrics
-    # Sonar runs HTTP internally on port 9000
     static_configs:
       - targets: ['sonarqube.cicd.local:9000']
-    # Authentication via System Passcode Header
     http_headers:
       X-Sonar-Passcode: $SONAR_WEB_SYSTEMPASSCODE
 
-  # 8. Artifactory (Artifact Metrics)
+  # 8. Artifactory
   - job_name: 'artifactory'
     metrics_path: /artifactory/api/v1/metrics
     scheme: https
@@ -169,19 +171,16 @@ scrape_configs:
       ca_file: /etc/prometheus/certs/ca.pem
     static_configs:
       - targets: ['artifactory.cicd.local:8443']
-    # Authentication via Bearer Token
     http_headers:
       Authorization: Bearer $ARTIFACTORY_ADMIN_TOKEN
 
-  # 9. Mattermost (Chat Metrics)
+  # 9. Mattermost
   - job_name: 'mattermost'
-    # Mattermost exposes metrics on a separate port
     static_configs:
       - targets: ['mattermost.cicd.local:8067']
 EOF
 
 # B. Grafana Config (grafana.ini)
-# Configures Database and Server settings.
 cat << EOF > "$GRAFANA_BASE/config/grafana.ini"
 [server]
 protocol = https
@@ -195,17 +194,14 @@ type = postgres
 host = postgres.cicd.local:5432
 name = grafana
 user = grafana
-# Password is injected via Environment Variable override (GF_DATABASE_PASSWORD)
 ssl_mode = require
 
 [security]
 admin_user = admin
-# Password is injected via Environment Variable override (GF_SECURITY_ADMIN_PASSWORD)
 EOF
 
 # C. Grafana Provisioning (datasources.yaml)
-# Auto-connects to Prometheus using the internal CA.
-# We must embed the CA content for tlsCACert to avoid needing a client cert.
+# We embed the CA content directly into the YAML for the TLS connection to Prometheus
 CA_CONTENT=$(cat "$SRC_CA_CRT" | sed 's/^/          /')
 
 cat << EOF > "$GRAFANA_BASE/provisioning/datasources/datasources.yaml"
@@ -219,8 +215,7 @@ datasources:
     isDefault: true
     jsonData:
       tlsAuth: false
-      tlsAuthWithCACert: false
-      tlsSkipVerify: false
+      tlsAuthWithCACert: true
     secureJsonData:
       tlsCACert: |
 $CA_CONTENT
@@ -247,22 +242,15 @@ EOF
 # --- 7. Permissions Lockdown ---
 echo "--- Phase 6: Locking Down Permissions ---"
 
-# Prometheus (UID 65534:65534 - 'nobody')
-# We must chown the entire directory so it can read configs and write data
+# Prometheus (UID 65534 - nobody)
 sudo chown -R 65534:65534 "$PROMETHEUS_BASE"
-
-# Grafana (UID 472:472 - 'grafana')
+# Grafana (UID 472 - grafana)
 sudo chown -R 472:472 "$GRAFANA_BASE"
 
-# Lock keys to owner-only
+# Lock keys
 sudo chmod 600 "$PROMETHEUS_BASE/config/certs/prometheus.key"
 sudo chmod 600 "$GRAFANA_BASE/config/certs/grafana.key"
-
-# Lock env files
 sudo chmod 600 "$GRAFANA_BASE/grafana.env"
 sudo chmod 600 "$HOST_CICD_ROOT/elk/elasticsearch-exporter.env"
 
 echo "✅ Architect Setup Complete."
-echo "   - Secrets persisted."
-echo "   - Configs generated."
-echo "   - Permissions locked (65534 / 472)."
