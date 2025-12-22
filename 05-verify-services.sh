@@ -76,7 +76,7 @@ docker exec \
     # --- Applications (The Retrofit) ---
     check_metric "GitLab"        "https://gitlab.cicd.local:10300/-/metrics"
     check_metric "Jenkins"       "https://jenkins.cicd.local:10400/prometheus/"
-    check_metric "Mattermost"    "http://mattermost:8067/metrics"
+    check_metric "Mattermost"    "http://mattermost.cicd.local:8067/metrics"
 
     # Authenticated Checks
     check_metric "SonarQube"     "http://sonarqube.cicd.local:9000/api/monitoring/metrics" \
