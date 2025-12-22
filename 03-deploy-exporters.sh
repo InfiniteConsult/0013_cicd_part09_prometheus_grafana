@@ -6,102 +6,140 @@
 #
 #  The "Translators" Script.
 #  Deploys metrics exporters for Host, Docker, and ES.
-#
-#  1. Certs: Auto-generates specific certs for Node/ES exporters.
-#  2. Config: Generates web-config.yml for TLS.
-#  3. Node Exporter: Host Network + TLS.
-#     * SECURITY: Binds to 172.30.0.1 (cicd-net Gateway) ONLY.
-#  4. ES Exporter: Cicd-net + TLS + CA Trust.
-#  5. cAdvisor: Cicd-net + HTTP (Docker Socket access).
 # -----------------------------------------------------------
 
 set -e
 echo "🚀 Deploying Exporters (The Translators)..."
 
-# --- 1. Load Paths ---
+# --- 1. Load Paths & Secrets ---
 HOST_CICD_ROOT="$HOME/cicd_stack"
 ELK_BASE="$HOST_CICD_ROOT/elk"
 PROMETHEUS_BASE="$HOST_CICD_ROOT/prometheus"
 CA_DIR="$HOST_CICD_ROOT/ca"
+CA_PASSWORD="password"  # Password for the Root CA Key
 
 # Exporter Config Dirs
 NODE_CONF_DIR="$PROMETHEUS_BASE/node_exporter"
 ES_EXP_CONF_DIR="$ELK_BASE/elasticsearch-exporter"
 
-# Ensure dirs exist
-mkdir -p "$NODE_CONF_DIR/certs"
-mkdir -p "$ES_EXP_CONF_DIR/certs"
+# --- 2. Permission Fix (The Host Takeover) ---
+echo "--- Preparing Directories ---"
+sudo mkdir -p "$NODE_CONF_DIR/certs"
+sudo mkdir -p "$ES_EXP_CONF_DIR/certs"
 
-# --- 2. Certificate Generation (Self-Healing) ---
-# Function to check and generate certificate if missing
-ensure_cert() {
+# Take ownership to current user for writing configs
+sudo chown -R "$USER":"$USER" "$NODE_CONF_DIR"
+sudo chown -R "$USER":"$USER" "$ES_EXP_CONF_DIR"
+
+# --- 3. Custom Certificate Generation ---
+
+ensure_generic_cert() {
     local service_name=$1
     local cert_path="$CA_DIR/pki/services/$service_name/$service_name.crt.pem"
-
     if [ ! -f "$cert_path" ]; then
         echo "   ⚠️  Certificate for $service_name not found. Generating..."
-        # We assume this script is running in the article directory, so we step back to CA dir
-        # If the CA script is missing, this will fail (as expected).
-        (
-            cd ../0006_cicd_part02_certificate_authority || exit 1
-            if [ -x "./02-issue-service-cert.sh" ]; then
-                ./02-issue-service-cert.sh "$service_name"
-            else
-                echo "❌ ERROR: CA generation script not found."
-                exit 1
-            fi
-        )
+        ( cd ../0006_cicd_part02_certificate_authority && ./02-issue-service-cert.sh "$service_name" )
         echo "   ✅ Generated $service_name"
     else
         echo "   ℹ️  Certificate for $service_name already exists."
     fi
 }
 
-echo "--- Verifying Certificates ---"
-ensure_cert "node-exporter.cicd.local"
-ensure_cert "elasticsearch-exporter.cicd.local"
+generate_node_exporter_cert() {
+    echo "--- Generating Custom Certificate for Node Exporter ---"
 
-# --- 3. Stage Certificates ---
+    local SERVICE="node-exporter"
+    local DOMAIN="node-exporter.cicd.local"
+    local GATEWAY_IP="172.30.0.1"
+
+    local KEY_FILE="$NODE_CONF_DIR/certs/node-exporter.key"
+    local CRT_FILE="$NODE_CONF_DIR/certs/node-exporter.crt"
+    local CSR_FILE="$NODE_CONF_DIR/certs/node-exporter.csr"
+    local EXT_FILE="$NODE_CONF_DIR/certs/v3.ext"
+
+    # Check if we need to generate (check if Gateway IP is in existing cert)
+    if [ -f "$CRT_FILE" ]; then
+        if openssl x509 -text -noout -in "$CRT_FILE" 2>/dev/null | grep -q "$GATEWAY_IP"; then
+            echo "   ℹ️  Valid Node Exporter cert exists (IP $GATEWAY_IP present)."
+            return
+        else
+            echo "   ⚠️  Old cert found without Gateway IP. Regenerating..."
+        fi
+    fi
+
+    echo "   1. Generating Private Key..."
+    openssl genrsa -out "$KEY_FILE" 2048
+
+    echo "   2. Generating CSR..."
+    openssl req -new -key "$KEY_FILE" -out "$CSR_FILE" \
+        -subj "/C=ZA/ST=Gauteng/L=Johannesburg/O=Local CICD Stack/CN=$DOMAIN"
+
+    echo "   3. Creating SAN Extension..."
+    cat << EOF > "$EXT_FILE"
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = $DOMAIN
+DNS.2 = localhost
+IP.1 = 127.0.0.1
+IP.2 = $GATEWAY_IP
+EOF
+
+    echo "   4. Signing with Root CA..."
+    sudo openssl x509 -req -in "$CSR_FILE" \
+        -CA "$CA_DIR/pki/certs/ca.pem" \
+        -CAkey "$CA_DIR/pki/private/ca.key" \
+        -CAcreateserial \
+        -out "$CRT_FILE" \
+        -days 825 \
+        -sha256 \
+        -extfile "$EXT_FILE" \
+        -passin pass:"$CA_PASSWORD"
+
+    sudo chown "$USER":"$USER" "$CRT_FILE"
+    rm "$CSR_FILE" "$EXT_FILE"
+    echo "   ✅ Generated Custom Node Exporter Cert."
+}
+
+echo "--- Verifying Certificates ---"
+generate_node_exporter_cert
+ensure_generic_cert "elasticsearch-exporter.cicd.local"
+
+# --- 4. Stage Certificates ---
 echo "--- Staging Certificates ---"
 
-# Copy Node Exporter Certs
-cp "$CA_DIR/pki/services/node-exporter.cicd.local/node-exporter.cicd.local.crt.pem" "$NODE_CONF_DIR/certs/node-exporter.crt"
-cp "$CA_DIR/pki/services/node-exporter.cicd.local/node-exporter.cicd.local.key.pem" "$NODE_CONF_DIR/certs/node-exporter.key"
-# Fix permissions (User inside container is typically 'nobody' or root depending on image)
-chmod 644 "$NODE_CONF_DIR/certs/node-exporter.crt"
-chmod 644 "$NODE_CONF_DIR/certs/node-exporter.key"
-
-# Copy ES Exporter Certs
 cp "$CA_DIR/pki/services/elasticsearch-exporter.cicd.local/elasticsearch-exporter.cicd.local.crt.pem" "$ES_EXP_CONF_DIR/certs/elasticsearch-exporter.crt"
 cp "$CA_DIR/pki/services/elasticsearch-exporter.cicd.local/elasticsearch-exporter.cicd.local.key.pem" "$ES_EXP_CONF_DIR/certs/elasticsearch-exporter.key"
-# Also need CA to verify ES connection
 cp "$CA_DIR/pki/certs/ca.pem" "$ES_EXP_CONF_DIR/certs/ca.pem"
 
-chmod 644 "$ES_EXP_CONF_DIR/certs/"*
-
-# --- 4. Generate TLS Web Configs ---
+# --- 5. Generate TLS Web Configs ---
 echo "--- Generating TLS Web Configs ---"
 
-# Node Exporter Web Config
 cat << EOF > "$NODE_CONF_DIR/web-config.yml"
 tls_server_config:
   cert_file: /etc/node_exporter/certs/node-exporter.crt
   key_file: /etc/node_exporter/certs/node-exporter.key
 EOF
 
-# ES Exporter Web Config
 cat << EOF > "$ES_EXP_CONF_DIR/web-config.yml"
 tls_server_config:
   cert_file: /etc/elasticsearch_exporter/certs/elasticsearch-exporter.crt
   key_file: /etc/elasticsearch_exporter/certs/elasticsearch-exporter.key
 EOF
 
-# --- 5. Deploy Node Exporter ---
+# --- 6. Permission Lockdown (UID 65534) ---
+echo "--- Locking Permissions (UID 65534) ---"
+sudo chown -R 65534:65534 "$NODE_CONF_DIR"
+sudo chown -R 65534:65534 "$ES_EXP_CONF_DIR"
+sudo chmod 600 "$NODE_CONF_DIR/certs/node-exporter.key"
+sudo chmod 600 "$ES_EXP_CONF_DIR/certs/elasticsearch-exporter.key"
+
+# --- 7. Deploy Node Exporter ---
 echo "--- Deploying Node Exporter (Host Hardware) ---"
 if [ "$(docker ps -q -f name=node-exporter)" ]; then docker rm -f node-exporter; fi
-
-# NOTE: We bind to 172.30.0.1 (Gateway IP) to expose metrics ONLY to the
-# internal bridge network and the host, effectively blocking external LAN access.
 
 docker run -d \
   --name node-exporter \
@@ -116,16 +154,14 @@ docker run -d \
   --web.listen-address=172.30.0.1:9100 \
   --web.config.file=/etc/node_exporter/web-config.yml
 
-# --- 6. Deploy Elasticsearch Exporter ---
+# --- 8. Deploy Elasticsearch Exporter ---
 echo "--- Deploying ES Exporter ---"
 if [ "$(docker ps -q -f name=elasticsearch-exporter)" ]; then docker rm -f elasticsearch-exporter; fi
 
-# Env file created by 01-setup-monitoring.sh
 ES_ENV_FILE="$HOST_CICD_ROOT/elk/elasticsearch-exporter.env"
 
-# Source env file to get ES_URI variable for the command line
 if [ -f "$ES_ENV_FILE" ]; then
-    source "$ES_ENV_FILE"
+    ES_URI=$(sudo grep ES_URI "$ES_ENV_FILE" | cut -d= -f2-)
 else
     echo "❌ ERROR: ES env file not found at $ES_ENV_FILE"
     exit 1
@@ -135,8 +171,7 @@ docker run -d \
   --name elasticsearch-exporter \
   --restart always \
   --network cicd-net \
-  --hostname elasticsearch-exporter \
-  --env-file "$ES_ENV_FILE" \
+  --hostname elasticsearch-exporter.cicd.local \
   --volume "$ES_EXP_CONF_DIR/web-config.yml":/web-config.yml:ro \
   --volume "$ES_EXP_CONF_DIR/certs":/etc/elasticsearch_exporter/certs:ro \
   --volume "$ES_EXP_CONF_DIR/certs/ca.pem":/certs/ca.pem:ro \
@@ -147,12 +182,9 @@ docker run -d \
   --es.all \
   --es.indices
 
-# --- 7. Deploy cAdvisor ---
+# --- 9. Deploy cAdvisor ---
 echo "--- Deploying cAdvisor (Container Stats) ---"
 if [ "$(docker ps -q -f name=cadvisor)" ]; then docker rm -f cadvisor; fi
-
-# NOTE: Updated to ghcr.io/google/cadvisor:v0.55.1
-# Added --device /dev/kmsg for OOM detection support.
 
 docker run -d \
   --name cadvisor \
@@ -166,9 +198,9 @@ docker run -d \
   --volume /sys:/sys:ro \
   --volume /var/lib/docker/:/var/lib/docker:ro \
   --volume /dev/disk/:/dev/disk:ro \
-  ghcr.io/google/cadvisor:v0.55.1
+  ghcr.io/google/cadvisor:latest
 
 echo "✅ Exporters Deployed."
 echo "   - Node Exporter: https://172.30.0.1:9100/metrics (Gateway Bind)"
-echo "   - ES Exporter:   https://elasticsearch-exporter:9114/metrics"
+echo "   - ES Exporter:   https://elasticsearch-exporter.cicd.local:9114/metrics"
 echo "   - cAdvisor:      http://cadvisor:8080/metrics"
