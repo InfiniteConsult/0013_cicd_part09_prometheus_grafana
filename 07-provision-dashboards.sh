@@ -6,7 +6,7 @@
 #
 #  Configures Grafana Dashboard Provisioning.
 #  1. Temporarily takes ownership of config dir.
-#  2. Downloads MODERN community JSON dashboards.
+#  2. Downloads Infrastructure & Application dashboards.
 #  3. Restores ownership to Grafana (UID 472).
 # -----------------------------------------------------------
 
@@ -41,35 +41,51 @@ providers:
       path: /etc/grafana/provisioning/dashboards/json
 EOF
 
-# --- 4. Download Community Dashboards ---
+# --- 4. Download Dashboards ---
 download_dash() {
     local ID=$1
     local NAME=$2
     local FILE="$JSON_DIR/${NAME}.json"
 
     echo "   ⬇️  Downloading $NAME (ID: $ID)..."
-    # Download as current user
+    # Download and attempt to auto-fix Datasource variables
+    # We replace common template variables with our fixed 'Prometheus' name
     curl -s "https://grafana.com/api/dashboards/$ID/revisions/latest/download" | \
-    sed 's/${DS_PROMETHEUS}/Prometheus/g' > "$FILE"
+    sed 's/${DS_PROMETHEUS}/Prometheus/g' | \
+    sed 's/"datasource": "\${DS_PROMETHEUS}"/"datasource": "Prometheus"/g' > "$FILE"
 }
 
-# 1. Node Exporter Full (ID: 1860) - The Gold Standard
+echo "--- Infrastructure Layer ---"
+# 1. Node Exporter Full (Host Hardware)
 download_dash "1860" "node-exporter-full"
 
-# 2. cAdvisor (ID: 14282) - Docker Container Stats
+# 2. cAdvisor (Docker Containers)
 download_dash "14282" "cadvisor-containers"
 
-# 3. Modern Prometheus 2.x (ID: 19105) - UPDATED (Replaces 3662)
+# 3. Elasticsearch Exporter
+download_dash "2322" "elasticsearch"
+
+# 4. Prometheus Modern (The Brain itself)
 download_dash "19105" "prometheus-modern"
 
-# 4. Go Processes (ID: 6671) - For Artifactory/Mattermost internals
-download_dash "6671" "go-processes"
+echo "--- Application Layer ---"
+# 5. GitLab Omnibus (Matches gitlab.cicd.local:10300)
+download_dash "5774" "gitlab-omnibus"
 
-# 5. Elasticsearch Exporter (ID: 2322)
-download_dash "2322" "elasticsearch"
+# 6. Jenkins (Matches /prometheus/ endpoint)
+download_dash "9964" "jenkins"
+
+# 7. SonarQube (Matches /api/monitoring/metrics)
+download_dash "14152" "sonarqube-system"
+
+# 8. Artifactory (Matches /artifactory/api/v1/metrics)
+download_dash "12113" "artifactory"
+
+# 9. Mattermost V2 (Matches standard Go metrics)
+download_dash "15582" "mattermost-perf-v2"
 
 # --- 5. Restore Permissions ---
 echo "   🔒 Restoring permissions for Grafana (UID 472)..."
 sudo chown -R 472:472 "$GRAFANA_BASE/provisioning"
 
-echo "✅ Dashboards Provisioned."
+echo "✅ All Dashboards Provisioned."
