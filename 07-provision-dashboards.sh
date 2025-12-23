@@ -62,7 +62,6 @@ download_dash "19105" "prometheus-modern"
 echo "--- Application Layer ---"
 download_dash "5774" "gitlab-omnibus"
 download_dash "9964" "jenkins"
-download_dash "12113" "artifactory"
 download_dash "15582" "mattermost-perf-v2"
 download_dash "6671" "go-processes"
 
@@ -72,6 +71,15 @@ if [ -f "sonarqube_dashboard.json" ]; then
     cp "sonarqube_dashboard.json" "$JSON_DIR/sonarqube-native.json"
 else
     echo "   ⚠️  WARNING: 'sonarqube_dashboard.json' not found in current directory."
+    echo "       (You can add it later and re-run this script)"
+fi
+
+
+if [ -f "artifactory_dashboard.json" ]; then
+    echo "   📥 Injecting local 'artifactory_dashboard.json'..."
+    cp "artifactory_dashboard.json" "$JSON_DIR/artifactory.json"
+else
+    echo "   ⚠️  WARNING: 'artifactory_dashboard.json' not found in current directory."
     echo "       (You can add it later and re-run this script)"
 fi
 
