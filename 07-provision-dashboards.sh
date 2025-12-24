@@ -60,7 +60,6 @@ download_dash "2322" "elasticsearch"
 download_dash "19105" "prometheus-modern"
 
 echo "--- Application Layer ---"
-download_dash "9964" "jenkins"
 download_dash "15582" "mattermost-perf-v2"
 download_dash "6671" "go-processes"
 
@@ -87,6 +86,14 @@ if [ -f "gitlab_dashboard.json" ]; then
     cp "gitlab_dashboard.json" "$JSON_DIR/gitlab.json"
 else
     echo "   ⚠️  WARNING: 'gitlab_dashboard.json' not found in current directory."
+    echo "       (You can add it later and re-run this script)"
+fi
+
+if [ -f "jenkins_dashboard.json" ]; then
+    echo "   📥 Injecting local 'jenkins_dashboard.json'..."
+    cp "jenkins_dashboard.json" "$JSON_DIR/jenkins.json"
+else
+    echo "   ⚠️  WARNING: 'jenkins_dashboard.json' not found in current directory."
     echo "       (You can add it later and re-run this script)"
 fi
 
