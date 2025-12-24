@@ -60,7 +60,6 @@ download_dash "2322" "elasticsearch"
 download_dash "19105" "prometheus-modern"
 
 echo "--- Application Layer ---"
-download_dash "15582" "mattermost-perf-v2"
 download_dash "6671" "go-processes"
 
 # --- 5. Inject Local Custom Dashboard ---
@@ -96,6 +95,15 @@ else
     echo "   ⚠️  WARNING: 'jenkins_dashboard.json' not found in current directory."
     echo "       (You can add it later and re-run this script)"
 fi
+
+if [ -f "mattermost_dashboard.json" ]; then
+    echo "   📥 Injecting local 'mattermost_dashboard.json'..."
+    cp "mattermost_dashboard.json" "$JSON_DIR/mattermost.json"
+else
+    echo "   ⚠️  WARNING: 'mattermost_dashboard.json' not found in current directory."
+    echo "       (You can add it later and re-run this script)"
+fi
+
 
 # --- 6. Restore Permissions ---
 echo "   🔒 Restoring permissions for Grafana (UID 472)..."
