@@ -929,3 +929,397 @@ Now that we have built our tools, we run them in sequence.
    *Result:* Artifactory restarts (approx. 2 mins) and Mattermost updates immediately.
 
 Our applications are now broadcasting. The doors are open. In the next chapter, we will deploy the translators to handle the infrastructure layer.
+
+# Chapter 5: The Translators – Infrastructure Sensors
+
+## 5.1 The "Translation" Problem
+
+We have successfully retrofitted our applications. GitLab, Jenkins, Artifactory, and Mattermost are now broadcasting their internal metrics in the standardized Prometheus format. We know *what* the software is doing.
+
+But software does not run in a vacuum; it runs on infrastructure.
+
+If the Host Machine runs out of RAM, every container crashes. If the Docker Daemon hangs due to disk I/O throttling, the pipeline stops. If the Elasticsearch cluster splits its brain, the logs vanish.
+
+Crucially, **Prometheus cannot speak to these components directly.**
+
+* The **Linux Kernel** speaks in system calls and `/proc` files.
+* The **Docker Daemon** speaks via a Unix Socket and Control Groups (cgroups).
+* **Elasticsearch** speaks via a proprietary JSON REST API.
+
+Prometheus only speaks HTTP. It expects to hit a `/metrics` endpoint and receive a plain-text list of key-value pairs. It does not know how to read a `cgroup` or query a Unix socket.
+
+To bridge this gap, we must deploy **Exporters**.
+
+An Exporter is a lightweight "Translation Agent." It sits right next to the infrastructure component it is monitoring (often as a sidecar). Its job is simple:
+
+1. **Query:** It polls the opaque internal state of the system (e.g., reading `/proc/meminfo`).
+2. **Translate:** It converts that raw data into the standardized Prometheus exposition format (e.g., `node_memory_MemTotal_bytes`).
+3. **Serve:** It exposes a lightweight HTTP server so Prometheus can scrape the translated data.
+
+In this chapter, we will deploy three distinct translators to cover the blind spots in our city:
+
+1. **Node Exporter:** For the Host Hardware (CPU, RAM, Disk, Network).
+2. **cAdvisor:** For the Docker Engine (Container resource usage).
+3. **Elasticsearch Exporter:** For the Log Storage Cluster (Health and Indices).
+
+We will automate this deployment with `04-deploy-exporters.sh`. However, accessing the *Host* hardware from inside a *Container* requires us to break the very isolation rules we have spent eight articles enforcing.
+
+## 5.2 The Host Sensor: Node Exporter (The "Boundary Breaker")
+
+**Node Exporter** is the industry standard for hardware monitoring. It reads from the Linux `/proc` and `/sys` filesystems to report on CPU usage, memory distribution, disk I/O latency, and network traffic.
+
+However, deploying Node Exporter in a containerized environment introduces a fundamental paradox: we want to monitor the **Host**, but the container is explicitly designed to be isolated *from* the Host. A standard container sees only its own virtual CPU slices and its own virtual network interface. It has no visibility into the physical hardware.
+
+To bridge this gap, we must deliberately break the isolation model we have spent eight articles enforcing. In our deployment script, we apply two powerful flags that "tear down the walls" of the container:
+
+1. **`--network host`:** We remove the network namespace isolation. This allows the exporter to see the host's actual physical network interfaces (eth0, wlan0), not just the virtual interface of the container.
+2. **`--pid host`:** We share the Process ID namespace. This allows the exporter to see the host's process table, preventing the "blindness" typical of containerized monitoring tools where they can only see their own children.
+
+### The Security "Dragon": The LAN Exposure
+
+Running a container in Host Mode (`--network host`) comes with a dangerous side effect: **Port Exposure.**
+
+When a normal container listens on port 9100, that port is reachable only inside the Docker network unless we explicitly map it (`-p 9100:9100`). But when a Host Mode container listens on port 9100, it opens that port on **every network interface of the physical machine**.
+
+This means your detailed hardware metrics—potentially revealing kernel versions, running processes, and exact resource usage—would be instantly accessible to anyone on your office WiFi or corporate LAN. In a "Zero Trust" architecture, this information leakage is unacceptable.
+
+### The Solution: The Gateway Bind
+
+We solve this by binding the exporter strictly to the **Docker Gateway IP**.
+
+In our network design (0005_cicd_part01_docker), we established `cicd-net` with a gateway of **`172.30.0.1`**. This IP address represents the "Host Machine" from the perspective of the containers. By configuring Node Exporter to listen *only* on this specific IP (`--web.listen-address=172.30.0.1:9100`), we create a "private door".
+
+* **From the LAN:** The port 9100 is closed.
+* **From the Container Network:** Prometheus can reach `172.30.0.1:9100` and scrape the metrics.
+
+### The Trust Gap: Certificates vs. IPs
+
+This binding solution creates a new problem: **TLS Identity**.
+
+Standard SSL certificates are issued to **Domain Names** (e.g., `node-exporter.cicd.local`). However, because of our specific network binding, Prometheus must connect to this target via its **IP Address** (`172.30.0.1`), not a DNS name.
+
+If we used a standard certificate, the TLS handshake would fail because the address in the URL (`172.30.0.1`) does not match the Common Name in the certificate (`node-exporter...`).
+
+To fix this, our `04-deploy-exporters.sh` script includes a specialized function called `generate_node_exporter_cert`. This function dynamically generates a custom OpenSSL configuration that adds a specific **Subject Alternative Name (SAN)** entry:
+
+```ini
+[alt_names]
+IP.2 = 172.30.0.1
+
+```
+
+By baking the Gateway IP directly into the cryptographic identity of the certificate, we ensure that Prometheus can connect securely to the raw IP address without breaking the chain of trust.
+
+## 5.3 The Container Sensor: cAdvisor (The "Introspector")
+
+While Node Exporter gives us the "Landlord's View" of the building (total electricity used, total water consumed), it tells us nothing about the individual tenants. If the server is slow, Node Exporter can tell us *that* CPU usage is high, but it cannot tell us *who* is responsible. Is Jenkins compiling a massive C++ project? Is GitLab performing a database migration? Or has the Artifactory Java process gone rogue?
+
+To answer these questions, we need an **Introspector**. We need a tool that can look inside the Docker engine, identify every running container, and measure its specific resource consumption against the kernel's accounting ledgers.
+
+The industry standard for this is **cAdvisor** (Container Advisor) by Google.
+
+Deploying cAdvisor involves navigating the complex boundary between the Docker Daemon and the Linux Kernel. Unlike a standard web app that stays in its lane, cAdvisor is designed to be invasive. It essentially "spies" on its neighbors. To allow this, our deployment script grants it significant privileges.
+
+### The Privilege Hurdle
+
+In `04-deploy-exporters.sh`, we launch cAdvisor with a specific set of flags that might look alarming to a security-conscious engineer:
+
+1. **`--privileged`:** We grant the container extended privileges.
+2. **`--volume /:/rootfs:ro`:** We mount the entire host filesystem as read-only.
+3. **`--volume /var/run:/var/run:ro`:** We mount the Docker socket.
+4. **`--volume /sys:/sys:ro`:** We mount the kernel's system directory.
+
+Why is this "God Mode" access necessary?
+
+It comes down to **Control Groups (cgroups)**. This is the Linux kernel feature that Docker uses to limit how much CPU and RAM a container can use. Every time a container writes to RAM or uses a CPU cycle, the kernel updates a counter in a virtual file located deep inside `/sys/fs/cgroup`.
+
+For cAdvisor to report that "Jenkins is using 2GB of RAM," it must be able to read these raw kernel counters directly from the host's `/sys` directory. Furthermore, to know that "cgroup ID 4f3a..." actually corresponds to the name "jenkins," it must talk to the Docker Socket to retrieve the container metadata.
+
+### The Security Mitigation
+
+Granting a container access to the Docker socket is equivalent to giving it root access to the host. If cAdvisor were compromised, an attacker could use that socket to spawn new privileged containers and take over the machine.
+
+We mitigate this risk through **Network Isolation**.
+
+Unlike Node Exporter, which we deliberately exposed to the Host Network, cAdvisor is a "Dark Container."
+
+* We do **not** use `--network host`. It lives inside `cicd-net`.
+* We do **not** publish any ports (`-p 8080:8080`).
+
+This means cAdvisor is unreachable from the host machine, the LAN, or the internet. It listens on port 8080 *only* inside the private Docker network. The only entity that can talk to it is Prometheus (which is also on `cicd-net`). By combining high privilege (local access) with zero visibility (network access), we adhere to the Principle of Least Privilege in a containerized context.
+
+## 5.4 The Middleware Sensor: Elasticsearch Exporter (The "Bridge")
+
+Our final infrastructure target is the **Elasticsearch** cluster we built in 0012_cicd_part08_elk. This is the "Memory" of our city, storing gigabytes of build logs and audit trails. If it fills up or slows down, our "Investigation Office" goes dark.
+
+Elasticsearch exposes a wealth of data via its API (`_cluster/health`, `_nodes/stats`), but it does so in hierarchical **JSON**. Prometheus cannot ingest JSON; it requires a flat, line-delimited format.
+
+To solve this, we deploy the **Elasticsearch Exporter**.
+
+This component functions as a **Protocol Bridge**. It sits between the Brain and the Memory.
+
+1. **Incoming:** It accepts a scrape request from Prometheus.
+2. **Translation:** It makes authenticated, encrypted API calls to the Elasticsearch cluster.
+3. **Outgoing:** It flattens the JSON response into metrics like `elasticsearch_cluster_health_status{color="green"}` and serves them to Prometheus.
+
+### The Authentication Chain
+
+Deploying this bridge in a secured environment requires navigating a complex authentication chain. We effectively have two secured conversations happening simultaneously:
+
+1. **Prometheus  Exporter:** Prometheus must trust the Exporter. We handle this by mounting our standard `web-config.yml` and the `elasticsearch-exporter` certificates we staged in Chapter 3.
+2. **Exporter  Elasticsearch:** The Exporter must authenticate with the Database. It needs the `elastic` superuser credentials to query deep statistics.
+
+We solve the second link using the **URI Injection** pattern. In Chapter 3 (`01-setup-monitoring.sh`), we pre-computed a file named `elasticsearch-exporter.env` containing the full connection string:
+`ES_URI=https://elastic:PASSWORD@elasticsearch.cicd.local:9200`.
+
+In our deployment script, we extract this URI and pass it to the container:
+`--es.uri="$ES_URI"`.
+
+### The Trust Triangle
+
+Finally, we must ensure the Exporter trusts the Database. Since Elasticsearch is serving a self-signed certificate (from our CA), the Exporter (written in Go) will reject the connection by default.
+
+We map our Root CA into the container at `/certs/ca.pem` and explicitly flag the application to use it:
+`--es.ca=/certs/ca.pem`.
+
+This closes the loop. Prometheus verifies the Exporter; the Exporter verifies the Database. The Chain of Trust is unbroken.
+
+## 5.5 Execution & Verification
+
+With our three translators defined—Node Exporter for the Host, cAdvisor for the Containers, and ES Exporter for the Middleware—we are ready to deploy.
+
+We automate this using the `04-deploy-exporters.sh` script. This script orchestrates the entire process: generating the custom Gateway certificate, fixing permissions, and launching the containers with the necessary privilege flags.
+
+### The Source Code: `04-deploy-exporters.sh`
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0013_cicd_part09_prometheus_grafana/04-deploy-exporters.sh`:
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#           03-deploy-exporters.sh
+#
+#  The "Translators" Script.
+#  Deploys metrics exporters for Host, Docker, and ES.
+# -----------------------------------------------------------
+
+set -e
+echo "🚀 Deploying Exporters (The Translators)..."
+
+# --- 1. Load Paths & Secrets ---
+HOST_CICD_ROOT="$HOME/cicd_stack"
+ELK_BASE="$HOST_CICD_ROOT/elk"
+PROMETHEUS_BASE="$HOST_CICD_ROOT/prometheus"
+CA_DIR="$HOST_CICD_ROOT/ca"
+CA_PASSWORD="password"  # Password for the Root CA Key
+
+# Exporter Config Dirs
+NODE_CONF_DIR="$PROMETHEUS_BASE/node_exporter"
+ES_EXP_CONF_DIR="$ELK_BASE/elasticsearch-exporter"
+
+# --- 2. Permission Fix (The Host Takeover) ---
+echo "--- Preparing Directories ---"
+sudo mkdir -p "$NODE_CONF_DIR/certs"
+sudo mkdir -p "$ES_EXP_CONF_DIR/certs"
+
+# Take ownership to current user for writing configs
+sudo chown -R "$USER":"$USER" "$NODE_CONF_DIR"
+sudo chown -R "$USER":"$USER" "$ES_EXP_CONF_DIR"
+
+# --- 3. Custom Certificate Generation ---
+
+ensure_generic_cert() {
+    local service_name=$1
+    local cert_path="$CA_DIR/pki/services/$service_name/$service_name.crt.pem"
+    if [ ! -f "$cert_path" ]; then
+        echo "   ⚠️  Certificate for $service_name not found. Generating..."
+        ( cd ../0006_cicd_part02_certificate_authority && ./02-issue-service-cert.sh "$service_name" )
+        echo "   ✅ Generated $service_name"
+    else
+        echo "   ℹ️  Certificate for $service_name already exists."
+    fi
+}
+
+generate_node_exporter_cert() {
+    echo "--- Generating Custom Certificate for Node Exporter ---"
+
+    local SERVICE="node-exporter"
+    local DOMAIN="node-exporter.cicd.local"
+    local GATEWAY_IP="172.30.0.1"
+
+    local KEY_FILE="$NODE_CONF_DIR/certs/node-exporter.key"
+    local CRT_FILE="$NODE_CONF_DIR/certs/node-exporter.crt"
+    local CSR_FILE="$NODE_CONF_DIR/certs/node-exporter.csr"
+    local EXT_FILE="$NODE_CONF_DIR/certs/v3.ext"
+
+    # Check if we need to generate (check if Gateway IP is in existing cert)
+    if [ -f "$CRT_FILE" ]; then
+        if openssl x509 -text -noout -in "$CRT_FILE" 2>/dev/null | grep -q "$GATEWAY_IP"; then
+            echo "   ℹ️  Valid Node Exporter cert exists (IP $GATEWAY_IP present)."
+            return
+        else
+            echo "   ⚠️  Old cert found without Gateway IP. Regenerating..."
+        fi
+    fi
+
+    echo "   1. Generating Private Key..."
+    openssl genrsa -out "$KEY_FILE" 2048
+
+    echo "   2. Generating CSR..."
+    openssl req -new -key "$KEY_FILE" -out "$CSR_FILE" \
+        -subj "/C=ZA/ST=Gauteng/L=Johannesburg/O=Local CICD Stack/CN=$DOMAIN"
+
+    echo "   3. Creating SAN Extension..."
+    cat << EOF > "$EXT_FILE"
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = $DOMAIN
+DNS.2 = localhost
+IP.1 = 127.0.0.1
+IP.2 = $GATEWAY_IP
+EOF
+
+    echo "   4. Signing with Root CA..."
+    sudo openssl x509 -req -in "$CSR_FILE" \
+        -CA "$CA_DIR/pki/certs/ca.pem" \
+        -CAkey "$CA_DIR/pki/private/ca.key" \
+        -CAcreateserial \
+        -out "$CRT_FILE" \
+        -days 825 \
+        -sha256 \
+        -extfile "$EXT_FILE" \
+        -passin pass:"$CA_PASSWORD"
+
+    sudo chown "$USER":"$USER" "$CRT_FILE"
+    rm "$CSR_FILE" "$EXT_FILE"
+    echo "   ✅ Generated Custom Node Exporter Cert."
+}
+
+echo "--- Verifying Certificates ---"
+generate_node_exporter_cert
+ensure_generic_cert "elasticsearch-exporter.cicd.local"
+
+# --- 4. Stage Certificates ---
+echo "--- Staging Certificates ---"
+
+cp "$CA_DIR/pki/services/elasticsearch-exporter.cicd.local/elasticsearch-exporter.cicd.local.crt.pem" "$ES_EXP_CONF_DIR/certs/elasticsearch-exporter.crt"
+cp "$CA_DIR/pki/services/elasticsearch-exporter.cicd.local/elasticsearch-exporter.cicd.local.key.pem" "$ES_EXP_CONF_DIR/certs/elasticsearch-exporter.key"
+cp "$CA_DIR/pki/certs/ca.pem" "$ES_EXP_CONF_DIR/certs/ca.pem"
+
+# --- 5. Generate TLS Web Configs ---
+echo "--- Generating TLS Web Configs ---"
+
+cat << EOF > "$NODE_CONF_DIR/web-config.yml"
+tls_server_config:
+  cert_file: /etc/node_exporter/certs/node-exporter.crt
+  key_file: /etc/node_exporter/certs/node-exporter.key
+EOF
+
+cat << EOF > "$ES_EXP_CONF_DIR/web-config.yml"
+tls_server_config:
+  cert_file: /etc/elasticsearch_exporter/certs/elasticsearch-exporter.crt
+  key_file: /etc/elasticsearch_exporter/certs/elasticsearch-exporter.key
+EOF
+
+# --- 6. Permission Lockdown (UID 65534) ---
+echo "--- Locking Permissions (UID 65534) ---"
+sudo chown -R 65534:65534 "$NODE_CONF_DIR"
+sudo chown -R 65534:65534 "$ES_EXP_CONF_DIR"
+sudo chmod 600 "$NODE_CONF_DIR/certs/node-exporter.key"
+sudo chmod 600 "$ES_EXP_CONF_DIR/certs/elasticsearch-exporter.key"
+
+# --- 7. Deploy Node Exporter ---
+echo "--- Deploying Node Exporter (Host Hardware) ---"
+if [ "$(docker ps -q -f name=node-exporter)" ]; then docker rm -f node-exporter; fi
+
+docker run -d \
+  --name node-exporter \
+  --restart always \
+  --network host \
+  --pid host \
+  --volume "/:/host:ro,rslave" \
+  --volume "$NODE_CONF_DIR/web-config.yml":/etc/node_exporter/web-config.yml:ro \
+  --volume "$NODE_CONF_DIR/certs":/etc/node_exporter/certs:ro \
+  quay.io/prometheus/node-exporter:latest \
+  --path.rootfs=/host \
+  --web.listen-address=172.30.0.1:9100 \
+  --web.config.file=/etc/node_exporter/web-config.yml
+
+# --- 8. Deploy Elasticsearch Exporter ---
+echo "--- Deploying ES Exporter ---"
+if [ "$(docker ps -q -f name=elasticsearch-exporter)" ]; then docker rm -f elasticsearch-exporter; fi
+
+ES_ENV_FILE="$HOST_CICD_ROOT/elk/elasticsearch-exporter.env"
+
+if [ -f "$ES_ENV_FILE" ]; then
+    ES_URI=$(sudo grep ES_URI "$ES_ENV_FILE" | cut -d= -f2-)
+else
+    echo "❌ ERROR: ES env file not found at $ES_ENV_FILE"
+    exit 1
+fi
+
+docker run -d \
+  --name elasticsearch-exporter \
+  --restart always \
+  --network cicd-net \
+  --hostname elasticsearch-exporter.cicd.local \
+  --volume "$ES_EXP_CONF_DIR/web-config.yml":/web-config.yml:ro \
+  --volume "$ES_EXP_CONF_DIR/certs":/etc/elasticsearch_exporter/certs:ro \
+  --volume "$ES_EXP_CONF_DIR/certs/ca.pem":/certs/ca.pem:ro \
+  quay.io/prometheuscommunity/elasticsearch-exporter:latest \
+  --web.config.file=/web-config.yml \
+  --es.uri="$ES_URI" \
+  --es.ca=/certs/ca.pem \
+  --es.all \
+  --es.indices
+
+# --- 9. Deploy cAdvisor ---
+echo "--- Deploying cAdvisor (Container Stats) ---"
+if [ "$(docker ps -q -f name=cadvisor)" ]; then docker rm -f cadvisor; fi
+
+docker run -d \
+  --name cadvisor \
+  --restart always \
+  --network cicd-net \
+  --hostname cadvisor.cicd.local \
+  --privileged \
+  --device /dev/kmsg \
+  --volume /:/rootfs:ro \
+  --volume /var/run:/var/run:ro \
+  --volume /sys:/sys:ro \
+  --volume /var/lib/docker/:/var/lib/docker:ro \
+  --volume /dev/disk/:/dev/disk:ro \
+  ghcr.io/google/cadvisor:latest
+
+echo "✅ Exporters Deployed."
+echo "   - Node Exporter: https://172.30.0.1:9100/metrics (Gateway Bind)"
+echo "   - ES Exporter:   https://elasticsearch-exporter.cicd.local:9114/metrics"
+echo "   - cAdvisor:      http://cadvisor:8080/metrics"
+
+```
+
+Run the script from your host machine:
+
+```bash
+chmod +x 04-deploy-exporters.sh
+./04-deploy-exporters.sh
+
+```
+
+**The Output Analysis:**
+Watch the logs closely. You will see:
+
+1. **Certificate Generation:** The script detects the missing `node-exporter` cert and generates a new one with the Gateway IP SAN.
+2. **Container Launch:** Three containers spin up (`node-exporter`, `cadvisor`, `elasticsearch-exporter`).
+3. **Access Points:** The script concludes by printing the targets:
+   * Node Exporter: `https://172.30.0.1:9100/metrics` (Gateway Access).
+   * ES Exporter: `https://elasticsearch-exporter.cicd.local:9114/metrics`.
+   * cAdvisor: `http://cadvisor:8080/metrics`.
+
+Our sensors are deployed. The city is now broadcasting on all frequencies. Before we turn on the "Brain" to record this data, we must perform a connectivity audit to ensure the signals are reaching the control center.
