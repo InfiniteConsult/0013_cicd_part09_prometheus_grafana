@@ -469,3 +469,463 @@ It reads the Root CA certificate from the host, indents it to match YAML syntax,
 ### 4. The Permission Fix (Phases 2 & 6)
 
 Finally, the script wraps the configuration generation with explicit permission handling. In Phase 2, it changes directory ownership to the current user to allow writing configs without `sudo`. In Phase 6, it performs the "Surgical Strike" discussed in **Section 3.4**, flipping ownership of the `prometheus` directory to UID `65534` and the `grafana` directory to UID `472`. This guarantees that when the containers launch in later chapters, they encounter a filesystem they can actually read.
+
+# Chapter 4: The Retrofit – Exposing the Metrics
+
+## 4.1 The Hidden Pulse
+
+We have successfully generated our "Map of the City" (`prometheus.yml`). The Brain knows where to look. However, if we were to launch Prometheus right now, it would be staring at a series of closed doors.
+
+Most enterprise software ships with observability **disabled** or strictly limited by default. This is a sound security practice known as "Information Hiding." A metrics endpoint is essentially a high-resolution blueprint of your internal operations. It reveals your query volume, your memory usage, your error rates, and even the topology of your internal network. Exposing this to the public internet—or even to the wrong subnet—is a vulnerability.
+
+Therefore, our services are currently holding their breath. GitLab's Nginx proxy blocks external access to `/-/metrics`. SonarQube demands a specific authentication header. Artifactory and Mattermost have the feature turned off entirely in their configuration files.
+
+To build our Observatory, we must perform a **"Retrofit."**
+
+We are moving into the realm of **Day 2 Operations**. We are not deploying fresh containers; we are surgically modifying the state of *running* infrastructure. We need to open these specific ports and endpoints to our private `cicd-net` network without exposing them to the host or the outside world.
+
+This presents an engineering challenge: consistency. While our goal is the same for every service ("Open the `/metrics` endpoint"), the implementation varies wildly because each tool speaks a different configuration language:
+
+* **Jenkins:** This is the exception that proves the rule. Because we installed the `prometheus` plugin in **Article 8**, Jenkins is already broadcasting. It exposes `/prometheus/` by default, requiring no further action from us today.
+* **The Monoliths (GitLab & SonarQube):** These legacy-style applications are configured via flat text files (`gitlab.rb`) or environment variables (`sonarqube.env`). We will manipulate them using **Bash**.
+* **The Modern Stack (Artifactory & Mattermost):** These newer applications store configuration in structured data formats (YAML) or internal databases accessible only via CLI APIs. We cannot safely edit these with `sed` or `echo`; we need the precision of **Python**.
+
+We will tackle these in two waves, starting with the text-based Monoliths.
+
+## 4.2 Patching the Monoliths (GitLab & SonarQube)
+
+Our first target is the legacy stack. These applications rely on traditional configuration files and environment variables. We will automate their reconfiguration using the **Bash** script `02-patch-services.sh`.
+
+This script performs two distinct operations: modifying a host-side text file for GitLab and injecting a secret into a container environment for SonarQube.
+
+### The Source Code: `02-patch-services.sh`
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0013_cicd_part09_prometheus_grafana/02-patch-services.sh`:
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#           02-patch-services.sh
+#
+#  The "Retrofit" Script.
+#  Modifies running services to expose metrics endpoints.
+#
+#  1. GitLab: Updates host-side gitlab.rb & triggers reconfigure.
+#  2. SonarQube: Injects System Passcode into env & redeploys.
+# -----------------------------------------------------------
+
+set -e
+echo "🔧 Starting Service Retrofit..."
+
+# --- 1. Load Secrets & Paths ---
+HOST_CICD_ROOT="$HOME/cicd_stack"
+MASTER_ENV_FILE="$HOST_CICD_ROOT/cicd.env"
+
+# GitLab Paths
+GITLAB_CONFIG="$HOST_CICD_ROOT/gitlab/config/gitlab.rb"
+
+# SonarQube Paths
+SONAR_BASE="$HOST_CICD_ROOT/sonarqube"
+SONAR_ENV_FILE="$SONAR_BASE/sonarqube.env"
+# Determine deploy script location relative to this script or hardcoded
+SONAR_DEPLOY_SCRIPT="$HOME/Documents/FromFirstPrinciples/articles/0010_cicd_part06_sonarqube/03-deploy-sonarqube.sh"
+
+if [ ! -f "$MASTER_ENV_FILE" ]; then
+    echo "ERROR: Master env file not found."
+    exit 1
+fi
+
+# Load SONAR_WEB_SYSTEMPASSCODE
+set -a; source "$MASTER_ENV_FILE"; set +a
+
+if [ -z "$SONAR_WEB_SYSTEMPASSCODE" ]; then
+    echo "ERROR: SONAR_WEB_SYSTEMPASSCODE not found in cicd.env"
+    echo "   Did you run 01-setup-monitoring.sh?"
+    exit 1
+fi
+
+# --- 2. Patch GitLab (Host File Update) ---
+echo "--- Patching GitLab ---"
+
+if [ -f "$GITLAB_CONFIG" ]; then
+    # Idempotency check: Don't append if it exists
+    if ! grep -q "monitoring_whitelist" "$GITLAB_CONFIG"; then
+        echo "   Appending monitoring whitelist to host config..."
+        # We need sudo because gitlab.rb is owned by root
+        echo "gitlab_rails['monitoring_whitelist'] = ['172.30.0.0/24', '127.0.0.1']" | sudo tee -a "$GITLAB_CONFIG" > /dev/null
+        echo "   Config updated."
+    else
+        echo "   Whitelist already present in gitlab.rb."
+    fi
+
+    # Trigger Reconfigure if container is running
+    if [ "$(docker ps -q -f name=gitlab)" ]; then
+        echo "   Triggering GitLab Reconfigure (this will take a minute)..."
+        docker exec gitlab gitlab-ctl reconfigure > /dev/null
+        echo "✅ GitLab Reconfigured."
+    else
+        echo "⚠️  GitLab container is not running. Changes will apply on next start."
+    fi
+else
+    echo "❌ ERROR: $GITLAB_CONFIG not found on host."
+    exit 1
+fi
+
+# --- 3. Patch SonarQube (Env Injection & Redeploy) ---
+echo "--- Patching SonarQube ---"
+
+if [ -f "$SONAR_ENV_FILE" ]; then
+    echo "   Injecting System Passcode into sonarqube.env..."
+
+    if ! grep -q "SONAR_WEB_SYSTEMPASSCODE" "$SONAR_ENV_FILE"; then
+        # Ensure we can write (we likely own the dir, but file might be 600)
+        chmod 600 "$SONAR_ENV_FILE"
+        echo "" >> "$SONAR_ENV_FILE"
+        echo "# Metrics Access" >> "$SONAR_ENV_FILE"
+        echo "SONAR_WEB_SYSTEMPASSCODE=$SONAR_WEB_SYSTEMPASSCODE" >> "$SONAR_ENV_FILE"
+    else
+        echo "   Passcode already present."
+    fi
+
+    echo "   Redeploying SonarQube to apply changes..."
+
+    if [ -x "$SONAR_DEPLOY_SCRIPT" ]; then
+        # Run the original deploy script from its directory context
+        (cd "$(dirname "$SONAR_DEPLOY_SCRIPT")" && ./03-deploy-sonarqube.sh)
+        echo "✅ SonarQube Patched and Redeploying."
+    else
+        echo "❌ ERROR: Sonar deploy script not found at $SONAR_DEPLOY_SCRIPT"
+        echo "   Please check the path or ensure Article 10 files exist."
+        exit 1
+    fi
+else
+    echo "❌ ERROR: sonarqube.env not found at $SONAR_ENV_FILE"
+    exit 1
+fi
+
+echo "✨ Retrofit Complete."
+
+```
+
+### Deconstructing the Retrofit
+
+**1. GitLab: The Whitelist (`monitoring_whitelist`)**
+GitLab's integrated Prometheus exporter is protected by a strict IP whitelist. By default, it allows only `localhost`. Prometheus, however, lives at `172.30.0.x`.
+
+* **The Config:** The script appends `gitlab_rails['monitoring_whitelist'] = ['172.30.0.0/24', '127.0.0.1']` to the host-side `gitlab.rb` file. This explicitly trusts our entire Docker subnet.
+* **The Execution:** Instead of restarting the heavy GitLab container (which takes 5 minutes), we trigger `gitlab-ctl reconfigure` via `docker exec`. This recompiles the internal Nginx configuration on the fly, applying the whitelist in about 60 seconds.
+
+**2. SonarQube: The Secret Handshake (`SONAR_WEB_SYSTEMPASSCODE`)**
+SonarQube handles metrics differently. It does not use IP whitelisting; it uses a shared secret.
+
+* **The Injection:** The script reads the `SONAR_WEB_SYSTEMPASSCODE` (which we generated in `01-setup-monitoring.sh`) from the master `cicd.env` and injects it into the scoped `sonarqube.env` file.
+* **The Redeployment:** Because Docker environment variables are immutable once a container is created, we cannot just "reload" SonarQube. We must destroy and recreate the container. The script automates this by calling the original `03-deploy-sonarqube.sh` script from 0010_cicd_part06_sonarqube, ensuring a clean state transition.
+
+## 4.2 Patching the Monoliths (GitLab & SonarQube)
+
+Our first target is the legacy stack. These applications rely on traditional configuration files and environment variables. We will automate their reconfiguration using the **Bash** script `02-patch-services.sh`.
+
+This script performs two distinct operations: modifying a host-side text file for GitLab and injecting a secret into a container environment for SonarQube.
+
+### The Source Code: `02-patch-services.sh`
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0013_cicd_part09_prometheus_grafana/02-patch-services.sh`:
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#           02-patch-services.sh
+#
+#  The "Retrofit" Script.
+#  Modifies running services to expose metrics endpoints.
+#
+#  1. GitLab: Updates host-side gitlab.rb & triggers reconfigure.
+#  2. SonarQube: Injects System Passcode into env & redeploys.
+# -----------------------------------------------------------
+
+set -e
+echo "🔧 Starting Service Retrofit..."
+
+# --- 1. Load Secrets & Paths ---
+HOST_CICD_ROOT="$HOME/cicd_stack"
+MASTER_ENV_FILE="$HOST_CICD_ROOT/cicd.env"
+
+# GitLab Paths
+GITLAB_CONFIG="$HOST_CICD_ROOT/gitlab/config/gitlab.rb"
+
+# SonarQube Paths
+SONAR_BASE="$HOST_CICD_ROOT/sonarqube"
+SONAR_ENV_FILE="$SONAR_BASE/sonarqube.env"
+# Determine deploy script location relative to this script or hardcoded
+SONAR_DEPLOY_SCRIPT="$HOME/Documents/FromFirstPrinciples/articles/0010_cicd_part06_sonarqube/03-deploy-sonarqube.sh"
+
+if [ ! -f "$MASTER_ENV_FILE" ]; then
+    echo "ERROR: Master env file not found."
+    exit 1
+fi
+
+# Load SONAR_WEB_SYSTEMPASSCODE
+set -a; source "$MASTER_ENV_FILE"; set +a
+
+if [ -z "$SONAR_WEB_SYSTEMPASSCODE" ]; then
+    echo "ERROR: SONAR_WEB_SYSTEMPASSCODE not found in cicd.env"
+    echo "   Did you run 01-setup-monitoring.sh?"
+    exit 1
+fi
+
+# --- 2. Patch GitLab (Host File Update) ---
+echo "--- Patching GitLab ---"
+
+if [ -f "$GITLAB_CONFIG" ]; then
+    # Idempotency check: Don't append if it exists
+    if ! grep -q "monitoring_whitelist" "$GITLAB_CONFIG"; then
+        echo "   Appending monitoring whitelist to host config..."
+        # We need sudo because gitlab.rb is owned by root
+        echo "gitlab_rails['monitoring_whitelist'] = ['172.30.0.0/24', '127.0.0.1']" | sudo tee -a "$GITLAB_CONFIG" > /dev/null
+        echo "   Config updated."
+    else
+        echo "   Whitelist already present in gitlab.rb."
+    fi
+
+    # Trigger Reconfigure if container is running
+    if [ "$(docker ps -q -f name=gitlab)" ]; then
+        echo "   Triggering GitLab Reconfigure (this will take a minute)..."
+        docker exec gitlab gitlab-ctl reconfigure > /dev/null
+        echo "✅ GitLab Reconfigured."
+    else
+        echo "⚠️  GitLab container is not running. Changes will apply on next start."
+    fi
+else
+    echo "❌ ERROR: $GITLAB_CONFIG not found on host."
+    exit 1
+fi
+
+# --- 3. Patch SonarQube (Env Injection & Redeploy) ---
+echo "--- Patching SonarQube ---"
+
+if [ -f "$SONAR_ENV_FILE" ]; then
+    echo "   Injecting System Passcode into sonarqube.env..."
+
+    if ! grep -q "SONAR_WEB_SYSTEMPASSCODE" "$SONAR_ENV_FILE"; then
+        # Ensure we can write (we likely own the dir, but file might be 600)
+        chmod 600 "$SONAR_ENV_FILE"
+        echo "" >> "$SONAR_ENV_FILE"
+        echo "# Metrics Access" >> "$SONAR_ENV_FILE"
+        echo "SONAR_WEB_SYSTEMPASSCODE=$SONAR_WEB_SYSTEMPASSCODE" >> "$SONAR_ENV_FILE"
+    else
+        echo "   Passcode already present."
+    fi
+
+    echo "   Redeploying SonarQube to apply changes..."
+
+    if [ -x "$SONAR_DEPLOY_SCRIPT" ]; then
+        # Run the original deploy script from its directory context
+        (cd "$(dirname "$SONAR_DEPLOY_SCRIPT")" && ./03-deploy-sonarqube.sh)
+        echo "✅ SonarQube Patched and Redeploying."
+    else
+        echo "❌ ERROR: Sonar deploy script not found at $SONAR_DEPLOY_SCRIPT"
+        echo "   Please check the path or ensure Article 10 files exist."
+        exit 1
+    fi
+else
+    echo "❌ ERROR: sonarqube.env not found at $SONAR_ENV_FILE"
+    exit 1
+fi
+
+echo "✨ Retrofit Complete."
+
+```
+
+### Deconstructing the Retrofit
+
+**1. GitLab: The Whitelist (`monitoring_whitelist`)**
+GitLab's integrated Prometheus exporter is protected by a strict IP whitelist. By default, it allows only `localhost`. Prometheus, however, lives at `172.30.0.x`.
+
+* **The Config:** The script appends `gitlab_rails['monitoring_whitelist'] = ['172.30.0.0/24', '127.0.0.1']` to the host-side `gitlab.rb` file. This explicitly trusts our entire Docker subnet.
+* **The Execution:** Instead of restarting the heavy GitLab container (which takes 5 minutes), we trigger `gitlab-ctl reconfigure` via `docker exec`. This recompiles the internal Nginx configuration on the fly, applying the whitelist in about 60 seconds.
+
+**2. SonarQube: The Secret Handshake (`SONAR_WEB_SYSTEMPASSCODE`)**
+SonarQube handles metrics differently. It does not use IP whitelisting; it uses a shared secret.
+
+* **The Injection:** The script reads the `SONAR_WEB_SYSTEMPASSCODE` (which we generated in `01-setup-monitoring.sh`) from the master `cicd.env` and injects it into the scoped `sonarqube.env` file.
+* **The Redeployment:** Because Docker environment variables are immutable once a container is created, we cannot just "reload" SonarQube. We must destroy and recreate the container. The script automates this by calling the original `03-deploy-sonarqube.sh` script from Article 10, ensuring a clean state transition.
+
+## 4.3 Patching the Modern Stack (Artifactory & Mattermost)
+
+For our modern, cloud-native applications, we cannot rely on simple text manipulation. Their configurations are stored in structured formats (YAML) or internal databases. We handle this complexity with the Python script `03-patch-additional-services.py`.
+
+### The Source Code: `03-patch-additional-services.py`
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0013_cicd_part09_prometheus_grafana/03-patch-additional-services.py`:
+
+```python
+#!/usr/bin/env python3
+
+import os
+import sys
+import subprocess
+import yaml
+from pathlib import Path
+
+# --- Configuration ---
+HOME_DIR = Path(os.environ.get("HOME"))
+CICD_STACK_DIR = HOME_DIR / "cicd_stack"
+
+# Artifactory Paths
+ART_VAR_DIR = CICD_STACK_DIR / "artifactory" / "var"
+ART_CONFIG_FILE = ART_VAR_DIR / "etc" / "system.yaml"
+# PATH TO ORIGINAL DEPLOY SCRIPT
+ART_DEPLOY_SCRIPT = HOME_DIR / "Documents/FromFirstPrinciples/articles/0009_cicd_part05_artifactory/05-deploy-artifactory.sh"
+
+# Mattermost Configuration
+MM_CONTAINER = "mattermost"
+
+def run_command(cmd_list, description):
+    """Runs a shell command and prints status."""
+    print(f"   EXEC: {description}...")
+    try:
+        result = subprocess.run(
+            cmd_list, check=True, capture_output=True, text=True
+        )
+        print(f"   ✅ Success.")
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"   ❌ Failed: {e.stderr.strip()}")
+        sys.exit(1)
+
+def patch_artifactory():
+    print(f"--- Patching Artifactory Configuration ({ART_CONFIG_FILE}) ---")
+
+    if not ART_CONFIG_FILE.exists():
+        print(f"❌ Error: Config file not found at {ART_CONFIG_FILE}")
+        sys.exit(1)
+
+    # 1. Read existing YAML
+    try:
+        with open(ART_CONFIG_FILE, 'r') as f:
+            config = yaml.safe_load(f)
+    except PermissionError:
+        print("❌ Error: Cannot read config file. Try running: sudo chmod o+r " + str(ART_CONFIG_FILE))
+        sys.exit(1)
+    except yaml.YAMLError as exc:
+        print(f"❌ Error parsing YAML: {exc}")
+        sys.exit(1)
+
+    # 2. Modify Structure (Idempotent)
+    if 'shared' not in config: config['shared'] = {}
+    if 'metrics' not in config['shared']: config['shared']['metrics'] = {}
+    config['shared']['metrics']['enabled'] = True
+    print(f"   > Set shared.metrics.enabled = true")
+
+    if 'artifactory' not in config: config['artifactory'] = {}
+    if 'metrics' not in config['artifactory']: config['artifactory']['metrics'] = {}
+    config['artifactory']['metrics']['enabled'] = True
+    print(f"   > Set artifactory.metrics.enabled = true")
+
+    # 3. Write to Temp File
+    tmp_path = Path("/tmp/artifactory_system.yaml.tmp")
+
+    with open(tmp_path, 'w') as f:
+        yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+
+    # 4. Overwrite Protected File
+    run_command(
+        ["sudo", "cp", str(tmp_path), str(ART_CONFIG_FILE)],
+        "Overwriting system.yaml (sudo)"
+    )
+    os.remove(tmp_path)
+    print(f"   ✅ Patched system.yaml")
+
+    # 5. Redeploy using Original Script (Instead of Restart)
+    print(f"--- Redeploying Artifactory via Script ---")
+    if ART_DEPLOY_SCRIPT.exists() and os.access(ART_DEPLOY_SCRIPT, os.X_OK):
+        print(f"   EXEC: {ART_DEPLOY_SCRIPT.name} ...")
+        try:
+            # Run relative to script directory so it finds its local env files
+            subprocess.run(
+                f"./{ART_DEPLOY_SCRIPT.name}",
+                cwd=str(ART_DEPLOY_SCRIPT.parent),
+                check=True,
+                shell=True
+            )
+            print("   ✅ Artifactory Redeployed.")
+        except subprocess.CalledProcessError:
+            print("   ❌ Failed to redeploy Artifactory.")
+    else:
+        print(f"   ⚠️  Deploy script not found or not executable at: {ART_DEPLOY_SCRIPT}")
+        print("      Falling back to docker restart...")
+        run_command(["docker", "restart", "artifactory"], "Restarting container")
+
+def patch_mattermost():
+    print(f"--- Patching Mattermost Configuration (via mmctl) ---")
+
+    try:
+        subprocess.run(["docker", "inspect", MM_CONTAINER], check=True, stdout=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        print(f"⚠️  Mattermost container '{MM_CONTAINER}' not running. Skipping.")
+        return
+
+    def mmctl_set(key, value):
+        cmd = [
+            "docker", "exec", "-i", MM_CONTAINER,
+            "mmctl", "--local", "config", "set", key, str(value)
+        ]
+        run_command(cmd, f"Setting {key} = {value}")
+
+    # Enable Metrics & Set Port
+    mmctl_set("MetricsSettings.Enable", "true")
+    mmctl_set("MetricsSettings.ListenAddress", ":8067")
+
+    # Reload
+    reload_cmd = ["docker", "exec", "-i", MM_CONTAINER, "mmctl", "--local", "config", "reload"]
+    run_command(reload_cmd, "Reloading Mattermost Config")
+
+def main():
+    print("🔧 Starting Additional Services Patcher...")
+    patch_artifactory()
+    patch_mattermost()
+    print("\n✨ All patches applied successfully.")
+
+if __name__ == "__main__":
+    main()
+
+```
+
+### Deconstructing the Retrofit
+
+**1. Artifactory: YAML Surgery**
+Artifactory 7 stores its configuration in `system.yaml`. This file is owned by UID 1030 and is often read-only to regular users.
+
+* **The Logic:** We use Python's `PyYAML` library to load the file structure into memory. We navigate the nested dictionary to `shared.metrics.enabled` and `artifactory.metrics.enabled`, setting both to `True`. This ensures metrics are collected for both the shared microservices (Router/Access) and the core Artifactory service.
+* **The Execution:** We write the modified config to a temporary file and use `sudo cp` to overwrite the protected original. We then trigger the original `05-deploy-artifactory.sh` script to force a clean restart of the Java process.
+
+**2. Mattermost: The CLI Override**
+Mattermost offers a powerful command-line interface (`mmctl`) that can modify the server's configuration database in real-time.
+
+* **The Logic:** We execute `mmctl config set MetricsSettings.Enable true` directly inside the container via `docker exec`. We also bind the listener to `:8067` to avoid port conflicts with the main web application.
+* **The Execution:** We finalize the change with `mmctl config reload`. Mattermost is unique in our stack; it applies these changes *instantly* without killing the process, demonstrating true cloud-native behavior.
+
+## 4.4 Execution & Verification
+
+Now that we have built our tools, we run them in sequence.
+
+1. **Run the Bash Patcher:**
+   ```bash
+   chmod +x 02-patch-services.sh
+   ./02-patch-services.sh
+   
+   ```
+   *Result:* GitLab reconfigures (approx. 60s) and SonarQube restarts (approx. 2 mins).
+2. **Run the Python Patcher:**
+   ```bash
+   chmod +x 03-patch-additional-services.py
+   ./03-patch-additional-services.py
+   
+   ```
+   *Result:* Artifactory restarts (approx. 2 mins) and Mattermost updates immediately.
+
+Our applications are now broadcasting. The doors are open. In the next chapter, we will deploy the translators to handle the infrastructure layer.
