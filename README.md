@@ -1640,3 +1640,202 @@ The nervous system is fully active. Every component of our architecture—from t
 But currently, these signals are just vanishing into the void. We have no "Brain" to record them, analyze them, or alert us when they deviate from the norm.
 
 In the next chapter, we will deploy **Prometheus**. We will configure it to scrape these validated endpoints, storing the history of our city in a Time Series Database so we can finally visualize the invisible.
+
+# Chapter 7: The Brain – Deploying Prometheus
+
+## 7.1 The Time-Series Database (TSDB)
+
+We have successfully built a nervous system. Across our "City," sensors are firing—reporting CPU temperatures, garbage collection pauses, and API latency. However, these signals are ephemeral. If Node Exporter reports that CPU usage spiked to 100% at 3:00 AM, but no one was watching at that exact second, the information is lost forever.
+
+We need a memory. We need a system that can ingest these millions of fleeting data points, timestamp them, and store them efficiently for retrieval.
+
+You might ask: *Why not just use Postgres?* We already have a robust Postgres deployment running for SonarQube and GitLab.
+
+The answer lies in the shape of the data. Operational telemetry is fundamentally different from transactional data.
+
+* **Transactional Data (Postgres):** "User A updated their profile." This is low volume, requires strict consistency (ACID), and often involves updating existing rows.
+* **Time-Series Data (Prometheus):** "CPU is 40%... now 42%... now 45%." This is massive volume (thousands of writes per second), purely append-only (we never "update" history), and is queried by time ranges ("Show me the trend over the last hour").
+
+Prometheus is a specialized **Time-Series Database (TSDB)** designed exactly for this workload. It does not wait for agents to send it data (the "Push" model). Instead, it acts as the "Brain" of our architecture. It maintains a list of targets (the "Map" we built in Chapter 3), and every 15 seconds, it reaches out to every limb of the infrastructure to capture its current state (the "Pull" model).
+
+This Pull model is crucial for system reliability. If a service goes down, Prometheus knows immediately because the scrape fails. In a Push model, the monitoring system can't easily distinguish between "The service is down" and "The service is just quiet."
+
+To give our Brain long-term memory, we will mount a Docker volume (`prometheus-data`). This ensures that even if we destroy and redeploy the Prometheus container, the history of our city remains intact.
+
+## 7.2 Security by Design (The "Nobody" User)
+
+Deploying Prometheus introduces a specific operational constraint that catches many engineers off guard: **Identity**.
+
+In the Docker ecosystem, laziness is common. Most containers default to running as `root` (UID 0) inside the container. This makes permission management easy—root can read and write anything—but it is a security nightmare. If a vulnerability is found in the application, the attacker gains root access to the container and potentially the host.
+
+Prometheus takes the high road. The official image is engineered to run as the **`nobody` user (UID 65534)** by default. This is the standard "Least Privilege" identity on Linux systems. It has no shell, no home directory, and most importantly, it owns nothing.
+
+This creates a conflict with our deployment strategy.
+
+We are injecting our "Map" (`prometheus.yml`) and our "Shield" (`web-config.yml`) by **Bind Mounting** them from the Host machine into the container.
+
+* **Host Path:** `~/cicd_stack/prometheus/config/prometheus.yml` (Owned by you, UID 1000).
+* **Container Path:** `/etc/prometheus/prometheus.yml` (Read by Prometheus, UID 65534).
+
+If we simply mounted these files, the Prometheus process would crash with `Permission Denied` because the `nobody` user cannot read files owned by your personal account (assuming standard strict permissions).
+
+This explains the "Surgical Strike" we performed back in **Chapter 3** (`01-setup-monitoring.sh`). By running `sudo chown -R 65534:65534` on the configuration directory, we pre-aligned the file ownership. We ensured that when the Brain wakes up, it has the permission to read its own memories.
+
+*Note: For the database itself (`/prometheus`), we utilize a **Named Volume** (`prometheus-data`). Unlike the configuration files which we manage manually, the database storage is managed entirely by the Docker Engine, which handles the complex permissions required for high-throughput writes automatically.*
+
+## 7.3 Self-Defense (TLS for Prometheus)
+
+We often think of Prometheus as a **Client**: it reaches out to scrape metrics from other services. But Prometheus is also a **Server**. It exposes a powerful HTTP API and a Web UI on port 9090.
+
+This interface is the "Brain's" primary output. It is where human operators write PromQL queries to diagnose outages, and it is where visualization tools like Grafana connect to fetch the data they need to draw charts.
+
+In a standard "quick start" tutorial, Prometheus runs on plain HTTP. This is acceptable for a hobby project, but in a production environment (and in our "City"), unencrypted HTTP is a vulnerability. It means that:
+
+1. **Snooping:** Anyone on the network can read the metric stream (which often contains sensitive business intelligence like build volumes or user counts).
+2. **Spoofing:** A malicious actor could impersonate the Prometheus server and feed false data to your dashboards.
+
+To prevent this, we apply the same **Zero Trust** standard to the monitoring system that we applied to the application stack. We configure Prometheus to speak **HTTPS** natively.
+
+This is handled by the `--web.config.file` flag in our deployment script. This flag points to the `web-config.yml` file we generated back in Chapter 3, which contains:
+
+```yaml
+tls_server_config:
+  cert_file: /etc/prometheus/certs/prometheus.crt
+  key_file: /etc/prometheus/certs/prometheus.key
+
+```
+
+When Prometheus starts, it will load these certificates and open a secure listener on port 9090.
+
+**The Payoff: End-to-End Trust**
+
+Because we have meticulously managed our Public Key Infrastructure (PKI) throughout this series, we get two massive benefits immediately:
+
+1. **The Host Browser:** When you visit `https://prometheus.cicd.local:9090` from your host machine, you will see a green "Secure" padlock. This is because in 0006_cicd_part02_certificate_authority, we imported our custom Root CA into the host's system trust store. Your browser recognizes the signature and trusts the site instantly.
+2. **The Future Connection (Grafana):** In the upcoming chapters, we will deploy Grafana. Grafana will not talk to Prometheus over `http://localhost`. It will connect securely via `https://prometheus.cicd.local:9090`. Because we injected the Root CA into the Grafana container during the "Setup" phase (Chapter 3), this internal API connection will be fully encrypted and mutually trusted without any "insecure skip verify" hacks.
+
+We have now secured the Brain. It scrapes securely, and it serves securely.
+
+
+
+
+
+
+## 7.4 The Deployment Script (`06-deploy-prometheus.sh`)
+
+We now have all the components: the User Identity (`nobody`), the Storage Volume (`prometheus-data`), the Configuration Map (`prometheus.yml`), and the TLS Shield (`web-config.yml`).
+
+We bring them together in the deployment script.
+
+**Analysis of the Script:**
+
+* **The Identity Flag (`--user 65534:65534`):** This forces the container to run strictly as the unprivileged `nobody` user. It matches the file ownerships we set on the host config directories.
+* **The "Map" Mount:** We mount our handcrafted `prometheus.yml` (from Chapter 3) to `/etc/prometheus/prometheus.yml`. This tells the Brain where the Limbs are.
+* **The "Shield" Mount:** We mount the `web-config.yml` and the `certs` directory. This enables the HTTPS listener.
+* **The "Memories" Mount:** We map the named volume `prometheus-data` to `/prometheus`. This is where the Time Series Database (TSDB) actually lives.
+
+### The Source Code: `06-deploy-prometheus.sh`
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0013_cicd_part09_prometheus_grafana/06-deploy-prometheus.sh`:
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#           06-deploy-prometheus.sh
+#
+#  Deploys "The Brain".
+#  - Network: cicd-net
+#  - Identity: prometheus.cicd.local (Self-scraping)
+#  - Security: TLS on port 9090 via web-config.yml
+# -----------------------------------------------------------
+
+set -e
+echo "🚀 Deploying Prometheus (The Brain)..."
+
+# --- 1. Load Paths ---
+PROMETHEUS_BASE="$HOME/cicd_stack/prometheus"
+
+# --- 2. Cleanup Old Container ---
+if [ "$(docker ps -q -f name=prometheus)" ]; then
+    docker rm -f prometheus
+fi
+
+# --- 3. Deploy ---
+# Note: We run as UID 65534 ('nobody') which owns the mounted volumes.
+docker run -d \
+  --name prometheus \
+  --restart always \
+  --network cicd-net \
+  --hostname prometheus.cicd.local \
+  --publish 127.0.0.1:9090:9090 \
+  --user 65534:65534 \
+  --volume "$PROMETHEUS_BASE/config/prometheus.yml":/etc/prometheus/prometheus.yml:ro \
+  --volume "$PROMETHEUS_BASE/config/web-config.yml":/etc/prometheus/web-config.yml:ro \
+  --volume "$PROMETHEUS_BASE/config/certs":/etc/prometheus/certs:ro \
+  --volume prometheus-data:/prometheus \
+  prom/prometheus:latest \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/prometheus \
+  --web.config.file=/etc/prometheus/web-config.yml \
+  --web.external-url=https://prometheus.cicd.local:9090
+
+echo "✅ Prometheus Deployed."
+echo "   URL: https://prometheus.cicd.local:9090"
+echo "   Note: Browser will warn about CA unless installed."
+
+```
+
+## 7.5 First Breath (Target Verification)
+
+It is time to turn on the machine.
+
+Run the deployment script from your host:
+
+```bash
+chmod +x 06-deploy-prometheus.sh
+./06-deploy-prometheus.sh
+
+```
+
+If the container starts successfully (check `docker ps`), we proceed to the "Moment of Truth."
+
+Open your web browser on the host and navigate to:
+**`https://prometheus.cicd.local:9090/targets`**
+
+*Note: Because you installed the Root CA in the CA article you should see a secure padlock icon in the address bar. The browser trusts this internal site just as it trusts a public bank website.*
+
+### The Goal: 9/9 UP
+
+You will be greeted by the Prometheus Targets interface. This is the real-time status dashboard of the collector.
+
+You are looking for a table listing our 9 defined targets (Node Exporter, cAdvisor, Jenkins, GitLab, etc.).
+
+* **State:** Every single target should be marked **UP** in green.
+* **Error:** There should be no red text or "Context Deadline Exceeded" errors.
+
+This screen is the visual confirmation of everything we worked for. It proves that the Brain can reach the Limbs, authenticate, and parse the data.
+
+### The First Query
+
+To prove that data is actually being recorded to the disk, click on **Query** in the top navigation bar.
+
+In the expression bar, type the simplest query possible:
+
+```promql
+up
+
+```
+
+Click **Execute**.
+
+You should see a list of results with a value of `1`.
+In PromQL, `up` is a synthetic metric.
+
+* `1` = The scrape was successful.
+* `0` = The scrape failed.
+
+If you switch to the **Graph** tab (next to Table), you will see a flat line at `1`. This is the heartbeat of your city. As long as that line stays at 1, your infrastructure is alive.
+
+The Brain is active. The data is flowing. We are now ready to give this data a face. In the next chapter, we will deploy **Grafana** to transform these raw numbers into beautiful, actionable insights.
