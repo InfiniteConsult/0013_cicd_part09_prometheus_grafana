@@ -1323,3 +1323,320 @@ Watch the logs closely. You will see:
    * cAdvisor: `http://cadvisor:8080/metrics`.
 
 Our sensors are deployed. The city is now broadcasting on all frequencies. Before we turn on the "Brain" to record this data, we must perform a connectivity audit to ensure the signals are reaching the control center.
+
+# Chapter 6: Quality Assurance – The Connectivity Verification
+
+## 6.1 The "Blind Spot" Risk
+
+We have generated our configurations, patched our services, and deployed our translators. On paper, our monitoring infrastructure is complete.
+
+However, if we were to launch Prometheus immediately, we would be taking a significant operational risk. In a complex distributed system like our "City," configuration does not guarantee connectivity.
+
+The moment Prometheus starts, it will attempt to scrape all nine targets simultaneously. If there is a single misconfiguration—a firewall rule blocking port 9100, a typo in a certificate Common Name, or a missing authentication token—Prometheus will flood its own logs with generic, unhelpful errors like `context deadline exceeded` or `connection refused`.
+
+Diagnosing these errors from *within* the Prometheus logs is difficult because Prometheus is a high-level aggregator. It tells you *that* it failed, but rarely *why* it failed in sufficient detail to debug a TLS handshake or a DNS resolution issue.
+
+This creates a **Blind Spot**. We have built the pipes, but we haven't checked if they flow.
+
+To mitigate this, we adopt the philosophy of **"Trust but Verify."** Before we deploy the "Brain" (Prometheus), we must audit the nervous system. We need to perform an integration test that simulates a Prometheus scrape from the exact network vantage point that Prometheus will occupy.
+
+Our verification scope covers three distinct layers of failure:
+
+1. **Network Reachability:** Can we route packets to the target IP/Port? (Is the door open?)
+2. **Identity Verification:** Does the internal DNS (`*.cicd.local`) resolve correctly, and does the SSL Certificate match that name? (Is this the right house?)
+3. **Security Authorization:** Does the target accept our credentials (`Bearer Token` or `Passcode`) and return a valid HTTP 200 payload? (Do we have the key?)
+
+Only when all three layers pass for every single service will we clear the "Brain" for deployment.
+
+## 6.2 The Vantage Point (Host vs. Container)
+
+A common mistake in validating distributed systems is testing from the wrong vantage point. It is tempting to simply run `curl https://gitlab.cicd.local:10300/` from your host terminal. If it returns a 200 OK, you might assume the system is healthy.
+
+This assumption is dangerous because your **Host Machine** has superpowers that your containers do not.
+
+1. **The `/etc/hosts` Cheat:** Your host machine resolves `gitlab.cicd.local` to `127.0.0.1` because we manually edited the hosts file in Article 7. Containers, however, rely on the internal Docker DNS server (`127.0.0.11`). If Docker DNS fails, your host will still work, but your containers will be blind.
+2. **The Network Bypass:** Your host machine accesses the containers via **Port Mapping** (e.g., `127.0.0.1:10300`). Containers access each other via the **Bridge Network** (`172.30.0.x:10300`). Testing via `localhost` bypasses the entire software-defined network (SDN) layer, failing to catch firewall rules or routing errors inside the bridge.
+3. **The Trust Store Divergence:** Your host machine trusts the CA because we ran `sudo update-ca-certificates`. The containers trust the CA because we baked it into their images (or mounted it). These are two completely separate filesystems. A pass on the host does not guarantee a pass in the container.
+
+To perform a valid audit, we must simulate the perspective of Prometheus itself. We need to stand inside the `cicd-net` network, use the Docker DNS resolver, and rely on the container's internal CA bundle.
+
+We achieve this by executing our verification logic **inside** the `dev-container`. This container acts as our "Test Probe." It sits on the same network as Prometheus, uses the same DNS, and has the same CA certificate mounted. If the `dev-container` can see the targets, we can be confident that Prometheus will see them too.
+
+## 6.3 The Verifier Script (`05-verify-services.sh`)
+
+To automate this audit, we utilize the `05-verify-services.sh` script. This tool acts as the "Integration Test" for the entire network mesh we have built over the last few articles. It bridges the gap between the host (where we hold the keys) and the container network (where the locks are).
+
+### Architectural Highlights
+
+**1. The Secret Bridge (Memory Injection)**
+We face a security dilemma: the authentication tokens (`SONAR_WEB_SYSTEMPASSCODE`, `ARTIFACTORY_ADMIN_TOKEN`) live in `cicd.env` on the Host. We need to use them inside the `dev-container` to run `curl`. We cannot simply `cp` the env file into the container, as that would risk leaving sensitive artifacts on the container's filesystem.
+
+The script solves this by reading the secrets into memory on the host and then injecting them directly into the environment of the `docker exec` process:
+
+```bash
+docker exec \
+  -e SONAR_PASS="$SONAR_PASS" \
+  -e ART_TOKEN="$ART_TOKEN" \
+  dev-container \
+  bash -c '...'
+
+```
+
+This ensures the secrets exist only in the RAM of the running test process and vanish immediately after the test completes.
+
+**2. The Reusable Probe (`check_metric`)**
+To avoid writing repetitive `curl` commands, the script defines a Bash function `check_metric` inside the container context. This function abstracts away the complexity of:
+
+* Handling both HTTP and HTTPS.
+* injecting arbitrary headers (Bearer Tokens vs. Sonar Passcodes).
+* Parsing the output to verify that actual content was returned (preventing false positives from empty 200 OK responses).
+
+### The Source Code: `05-verify-services.sh`
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0013_cicd_part09_prometheus_grafana/05-verify-services.sh`:
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#           05-verify-services.sh
+#
+#  The "Verifier" Script.
+#  Runs a test loop inside the dev-container to validate
+#  that all 8 endpoints are reachable and returning metrics.
+# -----------------------------------------------------------
+
+set -e
+
+# --- 1. Load Secrets from Host ---
+ENV_FILE="$HOME/cicd_stack/cicd.env"
+
+if [ -f "$ENV_FILE" ]; then
+    # We source the file so Bash handles quote removal automatically.
+    # We run this in a subshell so we don't pollute the main script environment excessively.
+    eval $(
+        set -a
+        source "$ENV_FILE"
+        # Print the variables we need so the parent script can capture them
+        echo "export SONAR_PASS='$SONAR_WEB_SYSTEMPASSCODE'"
+        echo "export ART_TOKEN='$ARTIFACTORY_ADMIN_TOKEN'"
+        set +a
+    )
+else
+    echo "❌ ERROR: cicd.env not found."
+    exit 1
+fi
+
+echo "🚀 Starting Metrics Verification (Targeting: dev-container)..."
+echo "---------------------------------------------------"
+
+# --- 2. Execute Loop Inside Container ---
+# We pass the secrets as environment variables to the container command
+docker exec \
+  -e SONAR_PASS="$SONAR_PASS" \
+  -e ART_TOKEN="$ART_TOKEN" \
+  dev-container \
+  bash -c '
+    # Function to check a metric endpoint
+    check_metric() {
+        NAME=$1
+        URL=$2
+        HEADER_FLAG=${3:-}
+        HEADER_VAL=${4:-}
+
+        echo "🔍 $NAME"
+        echo "   URL: $URL"
+
+        # We capture the output. If curl fails, it usually prints to stderr.
+        # We use tail -2 to show the last few lines of the metric payload.
+        if [ -n "$HEADER_FLAG" ]; then
+            CONTENT=$(curl -s "$HEADER_FLAG" "$HEADER_VAL" "$URL" | tail -n 2)
+        else
+            CONTENT=$(curl -s "$URL" | tail -n 2)
+        fi
+
+        # Check if content is empty (curl failed silently or empty response)
+        if [ -z "$CONTENT" ]; then
+            echo "   ❌ FAILED (No Content)"
+        else
+            echo "$CONTENT"
+            echo "   ✅ OK"
+        fi
+        echo "---------------------------------------------------"
+    }
+
+    # --- Infrastructure (The Translators) ---
+    check_metric "Node Exporter" "https://172.30.0.1:9100/metrics"
+    check_metric "ES Exporter"   "https://elasticsearch-exporter.cicd.local:9114/metrics"
+    check_metric "cAdvisor"      "http://cadvisor.cicd.local:8080/metrics"
+
+    # --- Applications (The Retrofit) ---
+    check_metric "GitLab"        "https://gitlab.cicd.local:10300/-/metrics"
+    check_metric "Jenkins"       "https://jenkins.cicd.local:10400/prometheus/"
+    check_metric "Mattermost"    "http://mattermost.cicd.local:8067/metrics"
+
+    # Authenticated Checks
+    check_metric "SonarQube"     "http://sonarqube.cicd.local:9000/api/monitoring/metrics" \
+        "-H" "X-Sonar-Passcode: $SONAR_PASS"
+
+    check_metric "Artifactory"   "https://artifactory.cicd.local:8443/artifactory/api/v1/metrics" \
+        "-H" "Authorization: Bearer $ART_TOKEN"
+'
+
+```
+
+## 6.4 Execution & Forensics
+
+We are now ready to audit the city. Run the verification script from your host machine:
+
+```bash
+chmod +x 05-verify-services.sh
+./05-verify-services.sh
+
+```
+
+**Pro Tip:** The script defaults to showing only the last 2 lines of output (using `tail -n 2`) to keep the console clean. If you wish to inspect the full flood of telemetry—which spans thousands of lines—you can edit the script to remove the `| tail -n 2` pipe and then redirect the output to a file for manual review:
+`./05-verify-services.sh > full_metrics_dump.txt`
+
+### The Evidence
+
+When you run the standard script, you should see a cascade of green checks. This is your "Connectivity Certificate."
+
+```text
+🚀 Starting Metrics Verification (Targeting: dev-container)...
+---------------------------------------------------
+🔍 Node Exporter
+   URL: https://172.30.0.1:9100/metrics
+promhttp_metric_handler_requests_total{code="503"} 0
+   ✅ OK
+---------------------------------------------------
+🔍 cAdvisor
+   URL: http://cadvisor.cicd.local:8080/metrics
+process_virtual_memory_max_bytes 1.8446744073709552e+19
+   ✅ OK
+---------------------------------------------------
+🔍 GitLab
+   URL: https://gitlab.cicd.local:10300/-/metrics
+ruby_sampler_duration_seconds_total 499.7820231985699
+   ✅ OK
+---------------------------------------------------
+🔍 SonarQube
+   URL: http://sonarqube.cicd.local:9000/api/monitoring/metrics
+sonarqube_health_web_status 1.0
+   ✅ OK
+...
+
+```
+
+If you see `✅ OK` for all 8 targets, you have proven three critical facts:
+
+1. **Routing:** The `cicd-net` bridge is correctly routing traffic between containers and the gateway.
+2. **DNS:** The internal names `gitlab.cicd.local` etc. are resolving to the correct internal IPs.
+3. **Trust:** The `dev-container` (and therefore Prometheus) successfully negotiated TLS handshakes with our internal Certificate Authority.
+
+But looking at these logs, you might wonder: **What exactly are we looking at?**
+What does `ruby_sampler_duration_seconds_total` actually mean? Why is `sonarqube_health_web_status` exactly 1.0?
+
+To move from "Verification" to "Understanding," we need to learn the language of Prometheus.
+
+## 6.5 Metric Anatomy: Understanding the Signal
+
+The output we just witnessed is not random noise. It is a highly structured language known as the **Prometheus Exposition Format**. Every line follows a strict syntax that tells the database exactly how to store and index the data.
+
+To an uninitiated eye, it looks like a wall of text. But once you understand the four fundamental "Data Types," you can read the health of your server like a dashboard.
+
+### 1. The Counter (The "Odometer")
+
+* **Identifier:** Usually ends in `_total` (e.g., `node_cpu_seconds_total`, `http_requests_total`).
+* **Behavior:** It starts at zero when the process launches and **only goes up**. It never decreases (unless the process crashes and restarts).
+* **The Analogy:** Think of the odometer in a car. It tells you the car has driven 100,000 kilometers in its lifetime.
+* **The Usage:** The raw number is mostly useless ("This server has handled 1 million requests since 2021"). The value lies in the **Rate of Change**. By comparing the counter now vs. 1 minute ago, Prometheus can calculate "Requests Per Second."
+* **Example from our Log:**
+```text
+node_network_transmit_drop_total 4671
+
+```
+
+
+This doesn't mean the network is failing *now*. It means 4,671 packets have been dropped since the machine turned on. If this number jumps to 5,000 in the next second, *then* we have a crisis.
+
+### 2. The Gauge (The "Speedometer")
+
+* **Identifier:** Standard nouns (e.g., `node_memory_MemFree_bytes`, `sonarqube_health_web_status`).
+* **Behavior:** It can go up and down arbitrarily.
+* **The Analogy:** Think of a speedometer or a fuel gauge. It tells you the state of the system **right now**.
+* **The Usage:** You don't calculate the rate of a gauge; you look at its absolute value. Is the tank empty? Is the temperature too high?
+* **Example from our Log:**
+```text
+process_virtual_memory_max_bytes 1.84e+19
+
+```
+
+
+This is a snapshot. At this exact millisecond, the process has access to this much virtual memory.
+
+### 3. The Histogram (The "Heatmap")
+
+* **Identifier:** Appears as a triplet: `_bucket`, `_sum`, and `_count`.
+* **Behavior:** It groups observations into "buckets" to track distribution, usually for latency.
+* **The Analogy:** Imagine sorting mail into slots based on weight: "Under 10g", "Under 50g", "Under 100g".
+* **The Usage:** This allows us to calculate **Percentiles** (e.g., the P99). It answers questions like "Do 99% of my users see a response time under 0.5 seconds?" even if the average is much lower.
+* **Example from our Log (Mattermost):**
+```text
+mattermost_api_time_bucket{le="0.1"} 15
+mattermost_api_time_bucket{le="+Inf"} 20
+
+```
+
+
+This tells us that out of 20 total requests (`+Inf`), 15 of them completed in **L**ess than or **E**qual to (`le`) 0.1 seconds.
+
+### 4. The Summary (The "Pre-Calculated")
+
+* **Identifier:** Contains a `quantile` label (e.g., `quantile="0.9"`).
+* **Behavior:** Similar to a Histogram, but the heavy math (calculating the P99) is done by the **Client** (the app), not the Server (Prometheus).
+* **The Usage:** Useful for accurate snapshots of complex runtimes (like Go or Java garbage collection) without burdening the monitoring server with expensive calculations.
+* **Example from our Log (Jenkins/Java):**
+```text
+jvm_gc_collection_seconds{quantile="0.5"} 0.003
+
+```
+
+
+This tells us the median (0.5) garbage collection pause was 3 milliseconds. We cannot re-aggregate this (you cannot average an average), but it gives us an instant health check.
+
+## 6.6 Decoding the City's Voice (Practical Examples)
+
+Now that we understand the grammar, we can translate the specific messages our city is sending. The `verification` script output provides a glimpse into the operational reality of our stack.
+
+**1. The Infrastructure Voice (Node Exporter & cAdvisor)**
+
+* **The Resource Tank:** `node_memory_MemFree_bytes` (Gauge).
+  If this gauge drops near zero, the host is starving. In a Linux environment, "Free" memory is often low because the kernel caches files, so we usually combine this with `node_memory_Cached_bytes` to get the true "Available" memory.
+* **The OOM Killer:** `container_memory_failures_total` (Counter).
+  This is one of the most critical signals in the Docker ecosystem. If this counter increases, it means a container tried to grab more RAM than its limit allowed, and the kernel likely killed it (OOM Killed). If you see this incrementing for SonarQube, your Java Heap is too big for the container.
+
+**2. The Application Voice (GitLab, Jenkins, SonarQube)**
+
+* **GitLab's Heartbeat:** `ruby_sampler_duration_seconds_total` (Counter).
+  GitLab is a massive Ruby on Rails monolith. This metric tracks the time the Ruby runtime spends just managing itself (sampling stack traces for performance profiling). A spike here indicates the application is struggling under its own weight, independent of user traffic.
+* **SonarQube's Pulse:** `sonarqube_health_web_status` (Gauge).
+  This is a binary signal: `1.0` means healthy, `0.0` means dead. It’s simple, but vital. It tells us that the web server is not just running, but successfully connected to its Database and Elasticsearch backend.
+* **Jenkins' Throughput:** `jvm_memory_pool_allocated_bytes_created` (Counter).
+  Jenkins is memory-hungry. This counter shows the churn—how many bytes of temporary objects are being created. In a heavy build environment, this number skyrockets as pipelines instantiate thousands of short-lived variables.
+
+**3. The Storage Voice (Artifactory)**
+
+* **The Warehouse Capacity:** `jfrt_stg_summary_repo_size_bytes` (Gauge).
+  This tells us the physical disk consumption of a specific repository (e.g., `libs-release-local`). It allows us to set alerts: "Warn me when the Maven repository exceeds 50GB."
+
+## 6.7 Conclusion
+
+We have done the hard work. We have retrofitted the endpoints, built the translators, pierced the isolation layers, and verified the signals.
+
+The nervous system is fully active. Every component of our architecture—from the silicon of the CPU to the Ruby code of GitLab—is now broadcasting a continuous stream of detailed telemetry.
+
+But currently, these signals are just vanishing into the void. We have no "Brain" to record them, analyze them, or alert us when they deviate from the norm.
+
+In the next chapter, we will deploy **Prometheus**. We will configure it to scrape these validated endpoints, storing the history of our city in a Time Series Database so we can finally visualize the invisible.
