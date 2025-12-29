@@ -1839,3 +1839,244 @@ In PromQL, `up` is a synthetic metric.
 If you switch to the **Graph** tab (next to Table), you will see a flat line at `1`. This is the heartbeat of your city. As long as that line stays at 1, your infrastructure is alive.
 
 The Brain is active. The data is flowing. We are now ready to give this data a face. In the next chapter, we will deploy **Grafana** to transform these raw numbers into beautiful, actionable insights.
+
+# Chapter 8: The Face (Part 1) – Automated Provisioning
+
+## 8.1 The "Infrastructure as Code" Philosophy
+
+We have built the "Brain" (Prometheus) and verified the "Nervous System" (The Exporters). Now we must build the "Face" of our city: the **Grafana** visualization layer.
+
+In a traditional setup, an engineer would launch Grafana, log in to the web interface, manually click "Add Data Source," type in `http://prometheus:9090`, and then manually upload JSON files one by one to create dashboards.
+
+This manual approach is **fragile**.
+
+* **It is not reproducible:** If you destroy the Grafana container to upgrade it, you lose your configurations unless you have perfectly managed your persistent volumes.
+* **It is tedious:** We have nine distinct services to visualize. Configuring them by hand is prone to human error (e.g., typing `https` instead of `http`).
+* **It violates our principles:** We are building a "City from Code." The state of our monitoring system should be defined in a script, not in the click-history of a web browser.
+
+To solve this, we utilize Grafana's **Provisioning** system.
+
+Grafana allows us to define "Providers" via configuration files (YAML) placed in specific directories. When the container starts, it scans these directories.
+
+1. **Datasources:** It automatically connects to Prometheus using the credentials and certificates we define in code.
+2. **Dashboards:** It automatically loads visualization definitions (JSON files) from a designated folder on the disk.
+
+This approach effectively turns our monitoring system into **Stateless Code**. We could burn down the entire monitoring stack, run our deployment scripts, and have the exact same beautiful dashboards appear within seconds, without ever touching a mouse.
+
+In this chapter, we will prepare these provisioning assets on our host machine so they are ready to be mounted into the Grafana container in Chapter 9.
+
+## 8.2 The Provider Configuration (`dashboards.yaml`)
+
+The first step in automated provisioning is to tell Grafana *where* to look for our visualizations. We do this by creating a provider configuration file.
+
+This YAML file acts as a map. It instructs Grafana to watch a specific directory on the filesystem (`/etc/grafana/provisioning/dashboards/json`). Any JSON file dropped into this folder will be instantly ingested and rendered as a dashboard in the UI.
+
+We will automate the creation of this file in our provisioning script `07-provision-dashboards.sh`, but it is important to understand what we are writing:
+
+```yaml
+apiVersion: 1
+
+providers:
+  - name: 'Default'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
+
+```
+
+**Key Configuration Details:**
+
+* **`path`**: This is the critical link. It points to a location *inside the container*. In Chapter 9, we will mount our host directory `~/cicd_stack/grafana/provisioning/dashboards/json` to this container path, bridging the gap between our code repo and the running application.
+* **`updateIntervalSeconds: 10`**: This is a powerful feature for development. It tells Grafana to re-scan the folder every 10 seconds. If we edit a JSON file on our host machine, Grafana detects the change and updates the dashboard live, without requiring a container restart.
+* **`allowUiUpdates: true`**: This permits us to make tweaks in the UI if necessary (though our goal is to keep everything in code).
+
+By defining this provider, we prepare the "empty vessel." Now we need to fill it with actual visualization definitions.
+
+## 8.3 The Dashboard Portfolio
+
+We will deploy a balanced portfolio of visualizations, split into two distinct layers: the **Infrastructure Layer** (Standard) and the **Application Layer** (Bespoke).
+
+### 1. The Infrastructure Layer (Community Standards)
+
+For standard tools like Docker and Linux, there is no need to reinvent the wheel. The open-source community has already built excellent dashboards. In our provisioning script, we will automate the downloading of these JSON definitions directly from Grafana.com:
+
+* **Node Exporter Full (ID: 1860):** A comprehensive view of the Host Machine. It tracks CPU core usage, RAM saturation, Disk I/O latency, and Network bandwidth. If the host is slow, this dashboard proves it.
+* **cAdvisor Containers (ID: 14282):** A granular view of the Docker Engine. It allows us to drill down into specific containers (e.g., "Why is `jenkins` using 4GB of RAM?").
+* **Elasticsearch (ID: 2322):** A health check for our logging cluster. It visualizes JVM heap usage, garbage collection times, and index health statuses.
+* **Go Processes (ID: 6671):** Since many of our components (Prometheus, Node Exporter, Mattermost) are written in Go, this dashboard gives us deep insight into their runtime behavior, specifically Goroutine counts and Garbage Collection pauses.
+
+### 2. The Application Layer (Bespoke Injection)
+
+For our core CI/CD applications—GitLab, Jenkins, SonarQube, Artifactory, and Mattermost—standard community dashboards often fail. They might expect different job names (e.g., `job="kubernetes-pods"` instead of our `job="jenkins"`), or they might not track the specific custom metrics we verified in Chapter 6.
+
+To ensure accurate visibility, we will **inject** our own custom-tailored JSON definitions. These dashboards are designed to map perfectly to the specific metrics we are emitting:
+
+* **Jenkins:** Visualizes the `jenkins_queue_size_value` to detect build backlogs and `jenkins_runs_failure_total` to track pipeline stability.
+* **SonarQube:** Tracks the critical `sonarqube_health_web_status` and the depth of the Compute Engine queue (`pending_tasks`).
+* **GitLab:** Monitors the Ruby on Rails runtime, specifically `puma_active_connections` and `http_requests_total` to measure traffic load.
+* **Artifactory:** Visualizes storage consumption (`jfrt_stg_summary_repo_size_bytes`) so we know when our artifact warehouse is filling up.
+* **Mattermost:** Tracks real-time user activity via `mattermost_active_users` and WebSocket connections.
+
+By combining downloaded standards with injected customs, we create a complete observability suite that covers everything from the silicon to the software.
+
+## 8.4 The Provisioning Script (`07-provision-dashboards.sh`)
+
+We automate the entire setup process with `07-provision-dashboards.sh`. This script is the "Construction Crew" for our visualization layer. It performs four critical tasks:
+
+1. **Preparation:** It creates the directory structure and temporarily takes ownership of it (since the directory is normally owned by the Grafana user, UID 472).
+2. **Configuration:** It generates the `dashboards.yaml` provider file we discussed in Section 8.2.
+3. **Downloading:** It fetches the "Infrastructure Layer" dashboards directly from Grafana's API. Crucially, it uses `sed` to patch them on the fly, replacing variable datasource names (like `${DS_PROMETHEUS}`) with our hardcoded value `"Prometheus"` to prevent "Datasource not found" errors.
+4. **Injection:** It detects our "Application Layer" custom JSON files in the current directory and copies them into the provisioning folder.
+
+### The Source Code: `07-provision-dashboards.sh`
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0013_cicd_part09_prometheus_grafana/07-provision-dashboards.sh`:
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#           07-provision-dashboards.sh
+#
+#  Configures Grafana Dashboard Provisioning.
+#  1. Temporarily takes ownership of config dir.
+#  2. Downloads Standard Dashboards.
+#  3. Injects LOCAL Custom Dashboards (SonarQube, etc).
+#  4. Restores ownership to Grafana (UID 472).
+# -----------------------------------------------------------
+
+set -e
+echo "🎨 Provisioning Grafana Dashboards..."
+
+# --- 1. Paths ---
+GRAFANA_BASE="$HOME/cicd_stack/grafana"
+DASH_CONF_DIR="$GRAFANA_BASE/provisioning/dashboards"
+JSON_DIR="$DASH_CONF_DIR/json"
+
+# --- 2. Prepare Permissions ---
+echo "   🔓 Temporarily unlocking permissions..."
+sudo mkdir -p "$JSON_DIR"
+sudo chown -R "$USER":"$USER" "$GRAFANA_BASE/provisioning"
+
+# --- 3. Create Provider Config ---
+echo "   📝 Writing Provider Config..."
+cat << EOF > "$DASH_CONF_DIR/dashboards.yaml"
+apiVersion: 1
+
+providers:
+  - name: 'Default'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
+EOF
+
+# --- 4. Download Standard Dashboards ---
+download_dash() {
+    local ID=$1
+    local NAME=$2
+    local FILE="$JSON_DIR/${NAME}.json"
+
+    echo "   ⬇️  Downloading $NAME (ID: $ID)..."
+    curl -s "https://grafana.com/api/dashboards/$ID/revisions/latest/download" | \
+    sed -E 's/\$\{DS_PROMETHEUS[^}]*\}/Prometheus/g' | \
+    sed 's/"datasource":.*"\${.*}"/"datasource": "Prometheus"/g' > "$FILE"
+}
+
+echo "--- Infrastructure Layer ---"
+download_dash "1860" "node-exporter-full"
+download_dash "14282" "cadvisor-containers"
+download_dash "2322" "elasticsearch"
+download_dash "19105" "prometheus-modern"
+
+echo "--- Application Layer ---"
+download_dash "6671" "go-processes"
+
+# --- 5. Inject Local Custom Dashboard ---
+# The script checks for local files and copies them to the provisioning dir
+
+if [ -f "sonarqube_dashboard.json" ]; then
+    echo "   📥 Injecting local 'sonarqube_dashboard.json'..."
+    cp "sonarqube_dashboard.json" "$JSON_DIR/sonarqube-native.json"
+else
+    echo "   ⚠️  WARNING: 'sonarqube_dashboard.json' not found."
+fi
+
+if [ -f "artifactory_dashboard.json" ]; then
+    echo "   📥 Injecting local 'artifactory_dashboard.json'..."
+    cp "artifactory_dashboard.json" "$JSON_DIR/artifactory.json"
+else
+    echo "   ⚠️  WARNING: 'artifactory_dashboard.json' not found."
+fi
+
+if [ -f "gitlab_dashboard.json" ]; then
+    echo "   📥 Injecting local 'gitlab_dashboard.json'..."
+    cp "gitlab_dashboard.json" "$JSON_DIR/gitlab.json"
+else
+    echo "   ⚠️  WARNING: 'gitlab_dashboard.json' not found."
+fi
+
+if [ -f "jenkins_dashboard.json" ]; then
+    echo "   📥 Injecting local 'jenkins_dashboard.json'..."
+    cp "jenkins_dashboard.json" "$JSON_DIR/jenkins.json"
+else
+    echo "   ⚠️  WARNING: 'jenkins_dashboard.json' not found."
+fi
+
+if [ -f "mattermost_dashboard.json" ]; then
+    echo "   📥 Injecting local 'mattermost_dashboard.json'..."
+    cp "mattermost_dashboard.json" "$JSON_DIR/mattermost.json"
+else
+    echo "   ⚠️  WARNING: 'mattermost_dashboard.json' not found."
+fi
+
+# --- 6. Restore Permissions ---
+echo "   🔒 Restoring permissions for Grafana (UID 472)..."
+sudo chown -R 472:472 "$GRAFANA_BASE/provisioning"
+
+echo "✅ All Dashboards Provisioned."
+
+```
+
+## 8.5 Staging the Custom Assets
+
+Before running the provisioning script, we must ensure our "Application Layer" assets are in place. The script expects five specific JSON files to exist in your current directory. It will copy these into the container's volume.
+
+Ensure you have the following files in `~/Documents/FromFirstPrinciples/articles/0013_cicd_part09_prometheus_grafana/`:
+
+1. **`sonarqube_dashboard.json`** (Maps to `sonarqube-native.json`)
+2. **`artifactory_dashboard.json`** (Maps to `artifactory.json`)
+3. **`gitlab_dashboard.json`** (Maps to `gitlab.json`)
+4. **`jenkins_dashboard.json`** (Maps to `jenkins.json`)
+5. **`mattermost_dashboard.json`** (Maps to `mattermost.json`)
+
+*Note: These files contain the thousands of lines of JSON definition required to draw the specific charts we verified in Chapter 6. You can download them from the repository accompanying this article series.*
+
+Once these files are staged, execute the provisioning script:
+
+```bash
+chmod +x 07-provision-dashboards.sh
+./07-provision-dashboards.sh
+
+```
+
+**What to Watch For:**
+
+* You should see `Downloading node-exporter-full...` as it hits the internet.
+* You should see `Injecting local 'sonarqube_dashboard.json'...` as it detects your custom files.
+* The script should finish with `✅ All Dashboards Provisioned.`
+
+If you see `⚠️ WARNING: ... not found`, it means you forgot to save the JSON file in the same folder as the script.
+
+With the provisioning complete, the visualization layer is essentially "pre-loaded" on the host disk. All that remains is to launch the Grafana container and let it mount these configurations. We will do this in the next chapter.
+
