@@ -2080,3 +2080,227 @@ If you see `⚠️ WARNING: ... not found`, it means you forgot to save the JSON
 
 With the provisioning complete, the visualization layer is essentially "pre-loaded" on the host disk. All that remains is to launch the Grafana container and let it mount these configurations. We will do this in the next chapter.
 
+# Chapter 9: The Face (Part 2) – Launching Grafana
+
+## 9.1 The Visualization Layer
+
+We have successfully built the "Brain" of our city. Prometheus is alive, scraping metrics every 15 seconds, and storing them in its time-series database. However, a brain without a face is difficult to interact with. While Prometheus does have a built-in web interface, it is designed for debugging queries, not for operational visibility. It gives you raw data, not insights.
+
+To solve this, we introduce **Grafana**.
+
+Grafana is the "Face" of our infrastructure. It connects to the Prometheus database, retrieves the raw time-series data, and transforms it into rich, interactive visualizations—graphs, gauges, heatmaps, and tables. If Prometheus tells you *what* happened at a specific microsecond, Grafana tells you *why* it matters by visualizing the trend over time.
+
+### The Shift to Statelessness
+
+In many tutorials, Grafana is deployed as a "Pet." It uses an embedded SQLite database stored in a Docker volume. If you want to back up your users or sessions, you have to back up that specific file. If the volume corrupts, you lose your accounts.
+
+We are building a **Production-Grade City**, so we will take a more robust approach. We will treat the Grafana container as **Stateless**.
+
+1. **State (Users & Sessions):** Instead of using a local SQLite file, we will connect Grafana to the **PostgreSQL** database we deployed in the Artifactory article. This creates a centralized "Source of Truth" for identity and session data that is independent of the visualization container.
+2. **Configuration (Dashboards & Settings):** Instead of manually editing settings in the UI, we will inject our configuration and dashboard definitions from the host file system.
+3. **Assets (Plugins):** We will use a standard Docker volume strictly for installed plugins and temporary files.
+
+This architecture makes our Grafana container almost entirely disposable. If we destroy it and redeploy it (which we will do frequently in a CI/CD context), it simply reconnects to the database, re-reads the dashboard files, and picks up exactly where it left off.
+
+### The Identity Constraint (UID 472)
+
+Just like Prometheus, Grafana adheres to strict security practices. The official Docker image runs as a non-privileged user named `grafana`, which corresponds to **UID 472**.
+
+This identity is critical for our storage strategy.
+
+* **The Config Maps:** We will bind-mount our configuration files (`grafana.ini`, `provisioning/`) as **Read-Only**. Since standard Linux files are world-readable, the `grafana` user can read them but cannot change them. This enforces **Immutability**.
+* **The Plugin Volume:** We will use a Docker Named Volume (`grafana-data`) for the `/var/lib/grafana` directory. Docker automatically manages the permissions of named volumes, ensuring UID 472 can write to it without us having to manually `chown` host directories.
+
+We have the architecture. Now, let's configure the connection to the database.
+
+## 9.2 Database Configuration (Environment Overrides)
+
+Traditionally, configuring software involves editing a large file like `grafana.ini`. While we did generate a baseline configuration in Chapter 3, editing it now to add database passwords would violate our security principles. It would force us to bake cleartext secrets into a file on the disk.
+
+Instead, we will use the **12-Factor App** methodology.
+
+Grafana allows us to override *any* setting in its configuration file using **Environment Variables**. The syntax is predictable:
+`GF_<SectionName>_<KeyName>`
+
+We will use this mechanism to inject our PostgreSQL connection details at runtime. This keeps our static configuration files clean and our secrets strictly in memory (or passed securely by the container runtime).
+
+Here are the specific overrides we will apply:
+
+* **`GF_DATABASE_TYPE=postgres`**: Explicitly tells Grafana to abandon its default SQLite engine.
+* **`GF_DATABASE_HOST=postgres.cicd.local:5432`**: Points to the shared database cluster we built previously. Note that we use the internal Docker DNS name.
+* **`GF_DATABASE_NAME=grafana`**: The specific database we created for this service.
+* **`GF_DATABASE_USER=grafana`**: The dedicated user account.
+* **`GF_DATABASE_SSL_MODE=require`**: This is **critical**. Our PostgreSQL cluster (configured in the Artifactory article) is set to reject any non-SSL connections from the network. If we omit this, Grafana will attempt a plain connection, and Postgres will immediately terminate it.
+
+By passing these variables, we turn a generic Grafana container into a specific, stateful node in our infrastructure.
+
+## 9.3 The Deployment Script (`08-deploy-grafana.sh`)
+
+We now bring all these requirements together in our deployment script. This script acts as the bridge between our secure "City" infrastructure (Certificates, Secrets, Database) and the Grafana container.
+
+**Key features of this script:**
+
+1. **Secret Loading:** It sources `~/cicd_stack/cicd.env` to retrieve the `GRAFANA_DB_PASSWORD`. This allows us to pass the database credentials securely without hardcoding them in a visible config file.
+2. **Environment Injection:** It uses `--env-file "$GRAFANA_ENV"` to load the base Grafana configuration variables we set up in Chapter 3.
+3. **Database Connection:** It explicitly sets the `GF_DATABASE_*` variables in the `docker run` command to force the connection to our shared PostgreSQL cluster, ensuring the container remains stateless.
+4. **SSL Enforcement:** It sets `GF_DATABASE_SSL_MODE=require` to comply with the strict security policy we configured in `pg_hba.conf`.
+
+### The Source Code: `08-deploy-grafana.sh`
+
+Create this file at `~/Documents/FromFirstPrinciples/articles/0013_cicd_part09_prometheus_grafana/08-deploy-grafana.sh`:
+
+```bash
+#!/usr/bin/env bash
+
+#
+# -----------------------------------------------------------
+#           08-deploy-grafana.sh
+#
+#  Deploys "The Face" (Grafana).
+#  - Network: cicd-net
+#  - Identity: grafana.cicd.local
+#  - Security: HTTPS (Port 3000) + UID 472 (Grafana User)
+#  - Backend: Connects to postgres.cicd.local (Stateless Container)
+# -----------------------------------------------------------
+
+set -e
+
+# --- 1. Load Secrets ---
+ENV_FILE="$HOME/cicd_stack/cicd.env"
+if [ -f "$ENV_FILE" ]; then
+    source "$ENV_FILE"
+else
+    echo "❌ ERROR: cicd.env not found."
+    exit 1
+fi
+
+echo "🚀 Deploying Grafana (The Face)..."
+
+# --- 2. Define Paths ---
+GRAFANA_BASE="$HOME/cicd_stack/grafana"
+GRAFANA_ENV="$GRAFANA_BASE/grafana.env"
+
+# --- 3. Permission Fix (Environment File) ---
+# The Docker CLI needs to read this file to inject variables.
+if [ -f "$GRAFANA_ENV" ]; then
+    echo "   🔓 Unlocking env file permissions..."
+    sudo chown "$USER":"$USER" "$GRAFANA_ENV"
+    sudo chmod 640 "$GRAFANA_ENV"
+fi
+
+# --- 4. Cleanup Old Container ---
+if [ "$(docker ps -q -f name=grafana)" ]; then
+    echo "   ♻️  Removing existing container..."
+    docker rm -f grafana
+fi
+
+# --- 5. Deploy ---
+# We inject the Postgres config via GF_DATABASE_* variables.
+# We explicitly set SSL_MODE=require because our Postgres acts as a strict CA authority.
+docker run -d \
+  --name grafana \
+  --restart always \
+  --network cicd-net \
+  --hostname grafana.cicd.local \
+  --publish 127.0.0.1:3000:3000 \
+  --user 472:472 \
+  --env-file "$GRAFANA_ENV" \
+  -e GF_DATABASE_TYPE=postgres \
+  -e GF_DATABASE_HOST=postgres.cicd.local:5432 \
+  -e GF_DATABASE_NAME=grafana \
+  -e GF_DATABASE_USER=grafana \
+  -e GF_DATABASE_PASSWORD="$GRAFANA_DB_PASSWORD" \
+  -e GF_DATABASE_SSL_MODE=require \
+  --volume "$GRAFANA_BASE/config/grafana.ini":/etc/grafana/grafana.ini:ro \
+  --volume "$GRAFANA_BASE/config/certs":/etc/grafana/certs:ro \
+  --volume "$GRAFANA_BASE/provisioning":/etc/grafana/provisioning:ro \
+  --volume grafana-data:/var/lib/grafana \
+  grafana/grafana:latest
+
+echo "✅ Grafana Deployed."
+echo "---------------------------------------------------"
+echo "   URL:      https://grafana.cicd.local:3000"
+echo "   User:     admin"
+echo "   Password: (Run the command below to see it)"
+echo "   grep GRAFANA_ADMIN_PASSWORD ~/cicd_stack/cicd.env"
+echo "---------------------------------------------------"
+
+```
+
+## 9.4 First Contact (Verification)
+
+It is time to turn on the face of our city.
+
+Run the deployment script from your host:
+
+```bash
+chmod +x 08-deploy-grafana.sh
+./08-deploy-grafana.sh
+
+```
+
+Wait about 15-30 seconds for the container to start and for the database migrations to complete. You can verify it is healthy with `docker ps`. If you want to confirm the database connection immediately, check the logs:
+
+```bash
+docker logs grafana | grep "Connecting to DB"
+
+```
+
+*You should see a message confirming the connection to `postgres`.*
+
+### The Moment of Truth
+
+Open your web browser on the host and navigate to:
+**`https://grafana.cicd.local:3000`**
+
+1. **Secure Lock:** You should see the green padlock immediately. This confirms our Root CA trust chain is working for this new service.
+2. **Login:**
+* **User:** `admin`
+* **Password:** Retrieve it from your environment file:
+```bash
+grep GRAFANA_ADMIN_PASSWORD ~/cicd_stack/cicd.env
+
+```
+
+
+
+
+
+### Verification 1: The Stateless Backend
+
+We need to prove that we are actually using the shared PostgreSQL cluster and not a hidden SQLite file.
+
+1. In the Grafana sidebar, locate the **Administration** section (usually a gear or shield icon at the bottom).
+2. Click **Settings**.
+3. In the search bar or list, look for the **`[database]`** section.
+4. Verify the following line:
+* **type:** `postgres`
+* **host:** `postgres.cicd.local:5432`
+
+
+
+If this says `sqlite3`, the environment variable injection failed. If it says `postgres`, you have successfully deployed a stateless application.
+
+### Verification 2: The Provisioned Dashboards
+
+We need to prove that our "Infrastructure as Code" provisioning worked.
+
+1. Click **Dashboards** in the left sidebar.
+2. You should see a populated list of dashboards ready to go. Unlike a manual installation which starts empty, your screen will be filled with the visualizations we defined in code:
+* *Artifactory Native Metrics*
+* *Cadvisor exporter*
+* *ElasticSearch*
+* *GitLab Omnibus Complete*
+* *Jenkins: Performance*
+* *Node Exporter Full*
+* *SonarQube Native Metrics*
+
+
+
+Click on **"Node Exporter Full"**.
+You should immediately see live graphs of your host's CPU, Memory, and Disk usage.
+
+Click on **"Jenkins: Performance"**.
+If your Jenkins container is running, you will see the build queue status and executor counts populated.
+
+The face is active. The system is observing itself. We have achieved Full Stack Visibility.
